@@ -2,6 +2,8 @@
 
 A desktop 2D orthogonal electronic CAD application for designing, routing, and prototyping perfboard circuits. Built with Python & PyQt6, featuring an accelerated native C++ multi-net AutoConnect router.
 
+![PerfBoardMaker Interface](images/AppLayout.png)
+
 ---
 
 ## Key Features
@@ -25,6 +27,8 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
   - **Optimize Board**: Automatically traces electrical continuity across all placed component pins, groups connected nets, clears existing traces/jumpers, and re-routes the entire board cleanly.
   - **Cost Weight Presets & Live Tuning**: Adjust routing weights (*Solder Move*, *Solder Turn*, *Jumper Start*, *Jumper Move*, *Jumper Turn*, *Jumper Cross*) in real time, switch between **`Balanced`**, **`More jumper`**, and **`More solder`**, or save custom presets.
 
+![Optimize Board Feature & Presets](images/OptimizeBoardFeature.png)
+
 ### 2. Multi-View & Inspection Tools
 - **Top & Bottom 2D Orthogonal Views (`F`)**:
   - **Top (Component Side)** shows component bodies, silkscreen labels, and leads.
@@ -33,10 +37,14 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
 - **Double-View Toggle**: Splits the viewport side-by-side (**Front** & **Back**) with live synchronized edits, mirrored wheel zoom, a mirrored `"+"` partner cursor matching the exact corresponding board coordinate, and a right-click middle splitter menu (`← / →`) to swap Left and Right sides.
 - **Split Inspector Panel**: Always displays active tool/mode settings in the top pane while dynamically revealing selected Component, Jumper, or Solder Path properties in the bottom pane (automatically hidden when nothing is selected).
 
+![Viewing Options](images/Viewing%20options.png)
+
 ### 3. Procedural Perfboard & Workspace
 - **Edge-Drag Dynamic Resizing**: Drag any edge or corner of the perfboard in the canvas to add or remove rows/columns without shifting existing components, solder traces, or jumpers out of place.
 - **Board Themes & Presets**: Choose *Green FR4*, *Phenolic Brown (Bakelite)*, *Blue FR4*, or *Matte Black FR4* (your last used theme is remembered across launches). Board presets include Standard (`34×24`), Small (`24×18`), Compact (`20×14`), Large (`48×32`), Eurocard (`60×40`), or Custom dimensions.
 - **Project Workflow**: `.pbrd` JSON project save/load, automatic launch fit-to-board, **200-step Undo/Redo**, periodic **Autosave** snapshots, and high-resolution **PNG Export (`Ctrl+E`)**.
+
+![4 Perfboard Themes](images/Themes.png)
 
 ---
 
