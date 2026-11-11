@@ -66,6 +66,8 @@ def serialize_state(
                 "color": j.color,
                 "side": j.side,
                 "uid": j.uid,
+                "start_pin": list(j.start_pin) if j.start_pin is not None else None,
+                "end_pin": list(j.end_pin) if j.end_pin is not None else None,
             }
             for j in jumpers
         ],

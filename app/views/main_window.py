@@ -1296,21 +1296,13 @@ class MainWindow(QMainWindow):
                 dlg.setRange(0, 0)
             dlg.setLabelText(f"Downloading update from GitHub... ({downloaded // 1024} KB)")
 
-    def _close_update_progress_dialog(self):
-        dlg = self._update_progress_dlg
-        if dlg is not None:
-            self._update_progress_dlg = None
-            dlg.blockSignals(True)
-            dlg.close()
-            dlg.deleteLater()
-
     def _on_download_finished(self, staged_repo_root: str, temp_base_dir: str):
-        was_canceled = (
-            self._update_cancel_event is not None and self._update_cancel_event.is_set()
-        )
-        self._close_update_progress_dialog()
+        if self._update_progress_dlg is not None:
+            self._update_progress_dlg.close()
+            self._update_progress_dlg.deleteLater()
+            self._update_progress_dlg = None
 
-        if was_canceled:
+        if self._update_cancel_event is not None and self._update_cancel_event.is_set():
             shutil.rmtree(temp_base_dir, ignore_errors=True)
             self._update_in_progress = False
             self.btn_update.setEnabled(True)
@@ -1345,7 +1337,10 @@ class MainWindow(QMainWindow):
             app.quit()
 
     def _on_download_failed(self, err_msg: str):
-        self._close_update_progress_dialog()
+        if self._update_progress_dlg is not None:
+            self._update_progress_dlg.close()
+            self._update_progress_dlg.deleteLater()
+            self._update_progress_dlg = None
 
         self._update_in_progress = False
         self.btn_update.setEnabled(True)

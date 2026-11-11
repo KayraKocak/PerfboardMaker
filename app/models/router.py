@@ -142,10 +142,10 @@ def get_all_obstacle_holes(
             if h not in allowed_holes:
                 obstacles.add(h)
 
-    # 3. Jumper endpoints
+    # 3. Jumper endpoints (perfboard hole ends only; off-grid pin ends sit on the module itself)
     for j in jumpers:
-        for end in ((j.start_col, j.start_row), (j.end_col, j.end_row)):
-            if end not in allowed_holes:
+        for end in (j.start_hole(), j.end_hole()):
+            if end is not None and end not in allowed_holes:
                 obstacles.add(end)
 
     return obstacles
@@ -1470,8 +1470,8 @@ def extract_connected_pin_groups(
                 adj[h].add(anchor)
 
     for j in jumpers:
-        s = (j.start_col, j.start_row)
-        e = (j.end_col, j.end_row)
+        s = j.start_hole() if j.start_pin is None else j.start_node()
+        e = j.end_hole() if j.end_pin is None else j.end_node()
         adj[s].add(e)
         adj[e].add(s)
 

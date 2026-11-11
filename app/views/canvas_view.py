@@ -169,7 +169,8 @@ class CanvasView(QGraphicsView):
         # Jumper interactive drawing state
         self.jumper_items: list[JumperItem] = []
         self._jumper_drag_active = False
-        self._jumper_start_hole: tuple[int, int] | None = None
+        self._jumper_start_hole: tuple[int | float, int | float] | None = None
+        self._jumper_start_pin: tuple[str, int, str] | None = None
         self._jumper_preview_item: JumperItem | None = None
 
         # Jumper handle dragging state (moving endpoints or bend points)
@@ -317,7 +318,8 @@ class CanvasView(QGraphicsView):
         self.reinit_board()
 
     def _on_component_moved_live(self, instance: PlacedComponent):
-        """Syncs component position to partner view in real time while dragging."""
+        """Syncs attached off-grid jumpers and partner view position in real time while moving/rotating."""
+        self._sync_attached_jumpers_for_component(instance)
         partner = self._partner_view
         if partner is None or self._syncing_partner or partner._syncing_partner:
             return
@@ -930,6 +932,10 @@ class CanvasView(QGraphicsView):
 
         # 8. Reconstruct jumpers
         for j_data in data.get("jumpers", []):
+            raw_sp = j_data.get("start_pin")
+            raw_ep = j_data.get("end_pin")
+            start_pin = (str(raw_sp[0]), int(raw_sp[1]), str(raw_sp[2])) if raw_sp else None
+            end_pin = (str(raw_ep[0]), int(raw_ep[1]), str(raw_ep[2])) if raw_ep else None
             wire = JumperWire(
                 start_col=j_data["start_col"],
                 start_row=j_data["start_row"],
@@ -938,7 +944,9 @@ class CanvasView(QGraphicsView):
                 bends=[tuple(b) for b in j_data.get("bends", [])],
                 color=j_data.get("color", DEFAULT_JUMPER_COLOR),
                 side=j_data.get("side", "top"),
-                uid=j_data.get("uid", "")
+                uid=j_data.get("uid", ""),
+                start_pin=start_pin,
+                end_pin=end_pin,
             )
             self.jumpers.append(wire)
             j_item = JumperItem(wire, self.config)
@@ -997,6 +1005,7 @@ class CanvasView(QGraphicsView):
         self.view_side_changed.emit(side)
 
     def add_component(self, type_id: str, col: int, row: int, rotation: int = 0, label: str = "") -> PlacedComponent:
+        REGISTRY.persist_if_remote(type_id)
         comp_def = REGISTRY.get(type_id)
         if not comp_def:
             raise ValueError(f"Unknown component type: {type_id}")
@@ -1019,16 +1028,90 @@ class CanvasView(QGraphicsView):
         self.record_undo_snapshot()
         return instance
 
+    def _find_off_grid_pin_at(
+        self, scene_pos: QPointF
+    ) -> tuple[PlacedComponent, int, str, float, float] | None:
+        """Returns closest jumper-only off-grid pin hit (instance, pin_idx, name, col_f, row_f) or None."""
+        thresh = self.config.pitch_px * 0.55
+        best_hit = None
+        best_dist = thresh
+        for c_item in self.component_items:
+            inst = c_item.instance
+            off_pins = inst.get_off_grid_pin_positions(c_item.comp_def)
+            for idx, (pname, cf, rf, _ptype) in enumerate(off_pins):
+                px, py = self.config.grid_to_board_pos(cf, rf)
+                d = math.hypot(scene_pos.x() - px, scene_pos.y() - py)
+                if d <= best_dist:
+                    best_dist = d
+                    best_hit = (inst, idx, pname, cf, rf)
+        return best_hit
+
+    def _snap_jumper_endpoint(
+        self,
+        scene_pos: QPointF,
+        col: int,
+        row: int,
+        anchor_pt: tuple[int | float, int | float] | None = None,
+        is_shift: bool = False,
+    ) -> tuple[int | float, int | float, tuple[str, int, str] | None]:
+        """Snaps a jumper endpoint to an off-grid component pin if close, else to a clamped board hole."""
+        if not is_shift:
+            pin_hit = self._find_off_grid_pin_at(scene_pos)
+            if pin_hit is not None:
+                comp_inst, pin_idx, pin_name, cf, rf = pin_hit
+                return (cf, rf, (comp_inst.uid, pin_idx, pin_name))
+
+        c_target, r_target = col, row
+        if is_shift and anchor_pt is not None:
+            sc = int(round(anchor_pt[0]))
+            sr = int(round(anchor_pt[1]))
+            if abs(c_target - sc) >= abs(r_target - sr):
+                r_target = sr
+            else:
+                c_target = sc
+
+        c_target = max(0, min(self.config.cols - 1, c_target))
+        r_target = max(0, min(self.config.rows - 1, r_target))
+        return (c_target, r_target, None)
+
+    def _sync_attached_jumpers_for_component(self, instance: PlacedComponent):
+        """Updates jumper endpoints anchored to off-grid pins when a component moves or rotates."""
+        comp_item = next((ci for ci in self.component_items if ci.instance is instance), None)
+        if comp_item is None:
+            return
+        off_pins = instance.get_off_grid_pin_positions(comp_item.comp_def)
+        for j_item in self.jumper_items:
+            j = j_item.jumper
+            moved = False
+            if j.start_pin is not None and j.start_pin[0] == instance.uid:
+                p_idx = j.start_pin[1]
+                if 0 <= p_idx < len(off_pins):
+                    j.start_col = off_pins[p_idx][1]
+                    j.start_row = off_pins[p_idx][2]
+                    moved = True
+            if j.end_pin is not None and j.end_pin[0] == instance.uid:
+                p_idx = j.end_pin[1]
+                if 0 <= p_idx < len(off_pins):
+                    j.end_col = off_pins[p_idx][1]
+                    j.end_row = off_pins[p_idx][2]
+                    moved = True
+            if moved:
+                j_item.prepareGeometryChange()
+                j_item.update()
+                self._sync_partner_jumper(j)
+
     def add_jumper(
         self,
-        c1: int,
-        r1: int,
-        c2: int,
-        r2: int,
+        c1: int | float,
+        r1: int | float,
+        c2: int | float,
+        r2: int | float,
         color: str | None = None,
         side: str | None = None,
         bends: list[tuple[int, int]] | None = None,
-        record_undo: bool = True
+        record_undo: bool = True,
+        start_pin: tuple[str, int, str] | None = None,
+        end_pin: tuple[str, int, str] | None = None,
     ) -> JumperItem:
         clr = color if color else self.active_jumper_color
         s = side if side else self.config.view_side
@@ -1039,7 +1122,9 @@ class CanvasView(QGraphicsView):
             end_row=r2,
             color=clr,
             side=s,
-            bends=list(bends or [])
+            bends=list(bends or []),
+            start_pin=start_pin,
+            end_pin=end_pin,
         )
         self.jumpers.append(wire)
 
@@ -1115,11 +1200,17 @@ class CanvasView(QGraphicsView):
             net_traces = [trace, *net_traces]
 
         net_holes = set(direct_holes)
+        net_pin_refs: set[tuple[str, int]] = set()
         for t in net_traces:
             net_holes.update(t.holes)
         for j in net_jumpers:
-            net_holes.add((j.start_col, j.start_row))
-            net_holes.add((j.end_col, j.end_row))
+            for h in (j.start_hole(), j.end_hole()):
+                if h is not None:
+                    net_holes.add(h)
+            if j.start_pin is not None:
+                net_pin_refs.add((j.start_pin[0], j.start_pin[1]))
+            if j.end_pin is not None:
+                net_pin_refs.add((j.end_pin[0], j.end_pin[1]))
 
         direct_pins: list[ConnectedPinInfo] = []
         net_only_pins: list[ConnectedPinInfo] = []
@@ -1145,6 +1236,17 @@ class CanvasView(QGraphicsView):
                         pin_name=pname,
                         col=pc,
                         row=pr,
+                        pin_type=ptype,
+                        via_jumper=True,
+                    ))
+            for op_idx, (pname, pcf, prf, ptype) in enumerate(inst.get_off_grid_pin_positions(comp_def)):
+                if (inst.uid, op_idx) in net_pin_refs:
+                    net_only_pins.append(ConnectedPinInfo(
+                        component_label=comp_label,
+                        component_name=comp_def.name,
+                        pin_name=f"{pname} (Jumper)",
+                        col=int(round(pcf)),
+                        row=int(round(prf)),
                         pin_type=ptype,
                         via_jumper=True,
                     ))
@@ -1183,23 +1285,34 @@ class CanvasView(QGraphicsView):
     def get_conductive_net_at(self, col: int, row: int, scene_pos: QPointF) -> tuple[list[SolderTrace], list[JumperWire]]:
         """
         Computes the complete conductive net connected through solder traces and jumpers.
-        Jumpers on both the front side and back side conduct electricity between their end holes.
+        Jumpers on both the front side and back side conduct electricity between their endpoints
+        (whether perfboard holes or off-grid jumper pins).
         """
         seed_trace: SolderTrace | None = None
         seed_jumper: JumperWire | None = None
-        seed_holes: set[tuple[int, int]] = set()
+        seed_nodes: set[tuple] = set()
 
-        # 1. Check direct hole match
-        if self.config.is_valid_hole(col, row):
+        # 1a. Check direct off-grid pin match first
+        pin_hit = self._find_off_grid_pin_at(scene_pos)
+        if pin_hit is not None:
+            p_node = ("pin", pin_hit[0].uid, pin_hit[1])
+            for j in self.jumpers:
+                if p_node in (j.start_node(), j.end_node()):
+                    seed_jumper = j
+                    seed_nodes.add(p_node)
+                    break
+
+        # 1b. Check direct hole match
+        if not seed_trace and not seed_jumper and self.config.is_valid_hole(col, row):
             t = self.solder_mgr.find_trace_with_hole(col, row)
             if t:
                 seed_trace = t
-                seed_holes.add((col, row))
+                seed_nodes.add(("hole", col, row))
             else:
                 for j in self.jumpers:
-                    if (col, row) in ((j.start_col, j.start_row), (j.end_col, j.end_row)):
+                    if (col, row) in (j.start_hole(), j.end_hole()):
                         seed_jumper = j
-                        seed_holes.add((col, row))
+                        seed_nodes.add(("hole", col, row))
                         break
 
         # 2. Check proximity to solder segments
@@ -1211,7 +1324,8 @@ class CanvasView(QGraphicsView):
                     p2 = QPointF(*self.config.grid_to_board_pos(*h2))
                     if dist_to_segment(scene_pos, p1, p2) <= pad_thresh:
                         seed_trace = t
-                        seed_holes.update([h1, h2])
+                        seed_nodes.add(("hole", *h1))
+                        seed_nodes.add(("hole", *h2))
                         break
                 if seed_trace:
                     break
@@ -1223,52 +1337,56 @@ class CanvasView(QGraphicsView):
                 if j_item.jumper.side == self.config.view_side or is_transparent:
                     if j_item.shape().contains(scene_pos) or j_item.get_segment_index_at(scene_pos) is not None:
                         seed_jumper = j_item.jumper
-                        seed_holes.add((j_item.jumper.start_col, j_item.jumper.start_row))
-                        seed_holes.add((j_item.jumper.end_col, j_item.jumper.end_row))
+                        seed_nodes.add(seed_jumper.start_node())
+                        seed_nodes.add(seed_jumper.end_node())
                         break
 
-        if not seed_trace and not seed_jumper and not seed_holes:
+        if not seed_trace and not seed_jumper and not seed_nodes:
             return [], []
 
-        # 4. BFS graph traversal to find the entire connected net
-        visited_holes: set[tuple[int, int]] = set(seed_holes)
+        # 4. BFS graph traversal across hole and off-grid pin nodes
+        visited_nodes: set[tuple] = set(seed_nodes)
         if seed_trace:
-            visited_holes.update(seed_trace.holes)
+            for h in seed_trace.holes:
+                visited_nodes.add(("hole", *h))
         if seed_jumper:
-            visited_holes.add((seed_jumper.start_col, seed_jumper.start_row))
-            visited_holes.add((seed_jumper.end_col, seed_jumper.end_row))
+            visited_nodes.add(seed_jumper.start_node())
+            visited_nodes.add(seed_jumper.end_node())
 
-        queue = deque(list(visited_holes))
+        queue = deque(list(visited_nodes))
         net_traces: set[SolderTrace] = set([seed_trace] if seed_trace else [])
         net_jumpers: set[JumperWire] = set([seed_jumper] if seed_jumper else [])
 
         while queue:
-            curr_h = queue.popleft()
+            curr_node = queue.popleft()
 
-            # Find all solder traces containing curr_h
-            for t in self.solder_mgr.traces:
-                if t not in net_traces and t.contains_hole(*curr_h):
-                    net_traces.add(t)
-                    for h in t.holes:
-                        if h not in visited_holes:
-                            visited_holes.add(h)
-                            queue.append(h)
+            # Find all solder traces containing curr_node (holes only)
+            if curr_node[0] == "hole":
+                hc, hr = curr_node[1], curr_node[2]
+                for t in self.solder_mgr.traces:
+                    if t not in net_traces and t.contains_hole(hc, hr):
+                        net_traces.add(t)
+                        for h in t.holes:
+                            h_node = ("hole", *h)
+                            if h_node not in visited_nodes:
+                                visited_nodes.add(h_node)
+                                queue.append(h_node)
 
-            # Find all jumpers starting or ending at curr_h (both front and back side!)
+            # Find all jumpers attached to curr_node (both front and back side!)
             for j in self.jumpers:
                 if j not in net_jumpers:
-                    p_start = (j.start_col, j.start_row)
-                    p_end = (j.end_col, j.end_row)
-                    if curr_h == p_start:
+                    s_node = j.start_node()
+                    e_node = j.end_node()
+                    if curr_node == s_node:
                         net_jumpers.add(j)
-                        if p_end not in visited_holes:
-                            visited_holes.add(p_end)
-                            queue.append(p_end)
-                    elif curr_h == p_end:
+                        if e_node not in visited_nodes:
+                            visited_nodes.add(e_node)
+                            queue.append(e_node)
+                    elif curr_node == e_node:
                         net_jumpers.add(j)
-                        if p_start not in visited_holes:
-                            visited_holes.add(p_start)
-                            queue.append(p_start)
+                        if s_node not in visited_nodes:
+                            visited_nodes.add(s_node)
+                            queue.append(s_node)
 
         return list(net_traces), list(net_jumpers)
 
@@ -1293,8 +1411,9 @@ class CanvasView(QGraphicsView):
                     for t in net_traces:
                         holes.update(t.holes)
                     for j in net_jumpers:
-                        holes.add((j.start_col, j.start_row))
-                        holes.add((j.end_col, j.end_row))
+                        for jh in (j.start_hole(), j.end_hole()):
+                            if jh is not None:
+                                holes.add(jh)
 
                     label = f"{comp.label} [{pname}]"
                     return AutoConnectTarget(
@@ -1309,39 +1428,43 @@ class CanvasView(QGraphicsView):
         # 2. Check Jumper Ends
         for j_item in self.jumper_items:
             j = j_item.jumper
+            s_hole = j.start_hole()
+            e_hole = j.end_hole()
             s_pos = self.config.grid_to_board_pos(j.start_col, j.start_row)
             e_pos = self.config.grid_to_board_pos(j.end_col, j.end_row)
-            if math.hypot(scene_pos.x() - s_pos[0], scene_pos.y() - s_pos[1]) <= pad_thresh or (col, row) == (j.start_col, j.start_row):
-                net_traces, net_jumpers = self.get_conductive_net_at(j.start_col, j.start_row, scene_pos)
-                holes = set([(j.start_col, j.start_row), (j.end_col, j.end_row)])
+            if s_hole is not None and (math.hypot(scene_pos.x() - s_pos[0], scene_pos.y() - s_pos[1]) <= pad_thresh or (col, row) == s_hole):
+                net_traces, net_jumpers = self.get_conductive_net_at(s_hole[0], s_hole[1], scene_pos)
+                holes = set([s_hole] + ([e_hole] if e_hole is not None else []))
                 for t in net_traces:
                     holes.update(t.holes)
                 for jw in net_jumpers:
-                    holes.add((jw.start_col, jw.start_row))
-                    holes.add((jw.end_col, jw.end_row))
-                c_name = col_index_to_name(j.start_col)
+                    for jh in (jw.start_hole(), jw.end_hole()):
+                        if jh is not None:
+                            holes.add(jh)
+                c_name = col_index_to_name(s_hole[0])
                 return AutoConnectTarget(
                     target_type="jumper_end",
-                    label=f"Jumper End ({c_name}{j.start_row + 1})",
+                    label=f"Jumper End ({c_name}{s_hole[1] + 1})",
                     holes=holes,
-                    center_hole=(j.start_col, j.start_row),
+                    center_hole=s_hole,
                     jumper_item=j_item,
                     jumper_end_idx=0
                 )
-            if math.hypot(scene_pos.x() - e_pos[0], scene_pos.y() - e_pos[1]) <= pad_thresh or (col, row) == (j.end_col, j.end_row):
-                net_traces, net_jumpers = self.get_conductive_net_at(j.end_col, j.end_row, scene_pos)
-                holes = set([(j.start_col, j.start_row), (j.end_col, j.end_row)])
+            if e_hole is not None and (math.hypot(scene_pos.x() - e_pos[0], scene_pos.y() - e_pos[1]) <= pad_thresh or (col, row) == e_hole):
+                net_traces, net_jumpers = self.get_conductive_net_at(e_hole[0], e_hole[1], scene_pos)
+                holes = set([e_hole] + ([s_hole] if s_hole is not None else []))
                 for t in net_traces:
                     holes.update(t.holes)
                 for jw in net_jumpers:
-                    holes.add((jw.start_col, jw.start_row))
-                    holes.add((jw.end_col, jw.end_row))
-                c_name = col_index_to_name(j.end_col)
+                    for jh in (jw.start_hole(), jw.end_hole()):
+                        if jh is not None:
+                            holes.add(jh)
+                c_name = col_index_to_name(e_hole[0])
                 return AutoConnectTarget(
                     target_type="jumper_end",
-                    label=f"Jumper End ({c_name}{j.end_row + 1})",
+                    label=f"Jumper End ({c_name}{e_hole[1] + 1})",
                     holes=holes,
-                    center_hole=(j.end_col, j.end_row),
+                    center_hole=e_hole,
                     jumper_item=j_item,
                     jumper_end_idx=1
                 )
@@ -2135,10 +2258,30 @@ class CanvasView(QGraphicsView):
                     event.accept()
                     return
 
-            # 3. Otherwise: start drawing a new straight jumper from start hole
-            if self.config.is_valid_hole(col, row):
+            # 3. Otherwise: start drawing a new straight jumper from off-grid pin or perfboard hole
+            pin_hit = self._find_off_grid_pin_at(scene_pos)
+            if pin_hit is not None:
+                comp_inst, pin_idx, pin_name, sc_val, sr_val = pin_hit
+                start_pin = (comp_inst.uid, pin_idx, pin_name)
+                self._jumper_drag_active = True
+                self._jumper_start_hole = (sc_val, sr_val)
+                self._jumper_start_pin = start_pin
+                preview_wire = JumperWire(
+                    start_col=sc_val,
+                    start_row=sr_val,
+                    end_col=sc_val,
+                    end_row=sr_val,
+                    color=self.active_jumper_color,
+                    side=self.config.view_side,
+                    start_pin=start_pin,
+                )
+                self._jumper_preview_item = JumperItem(preview_wire, self.config)
+                self._jumper_preview_item.setOpacity(0.8)
+                self.scene.addItem(self._jumper_preview_item)
+            elif self.config.is_valid_hole(col, row):
                 self._jumper_drag_active = True
                 self._jumper_start_hole = (col, row)
+                self._jumper_start_pin = None
                 preview_wire = JumperWire(
                     start_col=col, start_row=row, end_col=col, end_row=row,
                     color=self.active_jumper_color, side=self.config.view_side
@@ -2299,24 +2442,33 @@ class CanvasView(QGraphicsView):
 
         # Handle Jumper endpoint / bend point dragging
         if self._jumper_handle_drag_item is not None and self._jumper_handle_drag_idx is not None:
-            c_target, r_target = col, row
-            if is_shift:
-                # Constrain to horizontal or vertical relative to adjacent wire point
-                all_pts = self._jumper_handle_drag_item.jumper.all_points()
-                adj_idx = 1 if self._jumper_handle_drag_idx == 0 else self._jumper_handle_drag_idx - 1
-                if 0 <= adj_idx < len(all_pts):
-                    ac, ar = all_pts[adj_idx]
-                    dx = abs(c_target - ac)
-                    dy = abs(r_target - ar)
-                    if dx >= dy:
+            all_pts = self._jumper_handle_drag_item.jumper.all_points()
+            is_endpoint = (
+                self._jumper_handle_drag_idx == 0
+                or self._jumper_handle_drag_idx == len(all_pts) - 1
+            )
+            adj_idx = 1 if self._jumper_handle_drag_idx == 0 else self._jumper_handle_drag_idx - 1
+            anchor_pt = all_pts[adj_idx] if 0 <= adj_idx < len(all_pts) else None
+
+            if is_endpoint:
+                c_target, r_target, pin_ref = self._snap_jumper_endpoint(
+                    scene_pos, col, row, anchor_pt=anchor_pt, is_shift=is_shift
+                )
+            else:
+                pin_ref = None
+                c_target, r_target = col, row
+                if is_shift and anchor_pt is not None:
+                    ac, ar = int(round(anchor_pt[0])), int(round(anchor_pt[1]))
+                    if abs(c_target - ac) >= abs(r_target - ar):
                         r_target = ar
                     else:
                         c_target = ac
+                c_target = max(0, min(self.config.cols - 1, c_target))
+                r_target = max(0, min(self.config.rows - 1, r_target))
 
-            c_target = max(0, min(self.config.cols - 1, c_target))
-            r_target = max(0, min(self.config.rows - 1, r_target))
-
-            self._jumper_handle_drag_item.jumper.move_point(self._jumper_handle_drag_idx, c_target, r_target)
+            self._jumper_handle_drag_item.jumper.move_point(
+                self._jumper_handle_drag_idx, c_target, r_target, pin_ref=pin_ref
+            )
             self._jumper_handle_drag_item.prepareGeometryChange()
             self._jumper_handle_drag_item.update()
             self._sync_partner_jumper(self._jumper_handle_drag_item.jumper)
@@ -2371,21 +2523,12 @@ class CanvasView(QGraphicsView):
 
         # Jumper rubberband drag
         if self._jumper_drag_active and self._jumper_start_hole and self._jumper_preview_item:
-            c_target, r_target = col, row
-            if is_shift:
-                sc, sr = self._jumper_start_hole
-                dx = abs(c_target - sc)
-                dy = abs(r_target - sr)
-                if dx >= dy:
-                    r_target = sr
-                else:
-                    c_target = sc
-
-            c_target = max(0, min(self.config.cols - 1, c_target))
-            r_target = max(0, min(self.config.rows - 1, r_target))
-
+            c_target, r_target, end_pin = self._snap_jumper_endpoint(
+                scene_pos, col, row, anchor_pt=self._jumper_start_hole, is_shift=is_shift
+            )
             self._jumper_preview_item.jumper.end_col = c_target
             self._jumper_preview_item.jumper.end_row = r_target
+            self._jumper_preview_item.jumper.end_pin = end_pin
             self._jumper_preview_item.prepareGeometryChange()
             self._jumper_preview_item.update()
             event.accept()
@@ -2451,30 +2594,34 @@ class CanvasView(QGraphicsView):
             self._jumper_drag_active = False
             scene_pos = self.mapToScene(event.pos())
             col, row = self.config.board_pos_to_grid(scene_pos.x(), scene_pos.y())
-
             is_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier) or self._shift_pressed
-            if is_shift and self._jumper_start_hole:
-                sc, sr = self._jumper_start_hole
-                dx = abs(col - sc)
-                dy = abs(row - sr)
-                if dx >= dy:
-                    row = sr
-                else:
-                    col = sc
 
-            c_target = max(0, min(self.config.cols - 1, col))
-            r_target = max(0, min(self.config.rows - 1, row))
+            c_target, r_target, end_pin = self._snap_jumper_endpoint(
+                scene_pos, col, row, anchor_pt=self._jumper_start_hole, is_shift=is_shift
+            )
 
             start_h = self._jumper_start_hole
+            start_pin = self._jumper_start_pin
             self._cancel_jumper_preview()
 
-            if start_h and (c_target, r_target) != start_h:
-                new_jumper = self.add_jumper(start_h[0], start_h[1], c_target, r_target)
+            if start_h and (
+                (start_pin is not None and end_pin != start_pin)
+                or (start_pin is None and (end_pin is not None or (c_target, r_target) != start_h))
+            ):
+                new_jumper = self.add_jumper(
+                    start_h[0],
+                    start_h[1],
+                    c_target,
+                    r_target,
+                    start_pin=start_pin,
+                    end_pin=end_pin,
+                )
                 self.scene.clearSelection()
                 new_jumper.setSelected(True)
                 self.selection_changed.emit(new_jumper)
 
             self._jumper_start_hole = None
+            self._jumper_start_pin = None
             event.accept()
             return
 
@@ -2498,6 +2645,7 @@ class CanvasView(QGraphicsView):
             self._jumper_preview_item = None
         self._jumper_drag_active = False
         self._jumper_start_hole = None
+        self._jumper_start_pin = None
 
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()

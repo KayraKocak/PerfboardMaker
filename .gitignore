@@ -28,3 +28,6 @@ Thumbs.db
 
 # Local helper scripts
 github_push.bat
+
+# User-downloaded Fritzing components & search cache
+app/components/downloaded/

@@ -1,8 +1,13 @@
 """
 Component registry for PerfBoardMaker.
 """
-from typing import Optional
+from typing import Callable, Optional
 from app.models.component_def import ComponentDef
+from app.components.fritzing_part import (
+    FritzingComponentDef,
+    load_downloaded_parts,
+    save_downloaded_part,
+)
 from app.components.arduino_nano import ArduinoNanoDef
 from app.components.push_button import PushButtonDef
 from app.components.capacitor import ElectrolyticCapacitorDef
@@ -33,6 +38,8 @@ from app.components.modules import (
 class ComponentRegistry:
     def __init__(self):
         self._components: dict[str, ComponentDef] = {}
+        self._previews: dict[str, ComponentDef] = {}
+        self._install_listeners: list[Callable[[str], None]] = []
         self._categories: list[str] = [
             "Microcontrollers",
             "Passives & Switches",
@@ -42,6 +49,7 @@ class ComponentRegistry:
             "Wireless & RF",
         ]
         self._register_builtins()
+        self.load_downloaded()
 
     def _register_builtins(self):
         # 1. Microcontrollers
@@ -103,13 +111,49 @@ class ComponentRegistry:
         self.register(NRF24L01Def())
         self.register(NRF24L01PALNADef())
 
+    def load_downloaded(self) -> None:
+        for comp_def in load_downloaded_parts():
+            self.register(comp_def)
+
     def register(self, comp_def: ComponentDef):
+        self._previews.pop(comp_def.type_id, None)
         self._components[comp_def.type_id] = comp_def
         if comp_def.category not in self._categories:
             self._categories.append(comp_def.category)
 
+    def register_preview(self, comp_def: ComponentDef):
+        """Registers a verified online search result for drag/placement without persisting yet."""
+        if comp_def.type_id not in self._components:
+            self._previews[comp_def.type_id] = comp_def
+
+    def is_installed(self, type_id: str) -> bool:
+        return type_id in self._components
+
+    def add_install_listener(self, cb: Callable[[str], None]) -> None:
+        if cb not in self._install_listeners:
+            self._install_listeners.append(cb)
+
+    def persist_if_remote(self, type_id: str) -> bool:
+        """
+        Permanently downloads/saves a remote Fritzing preview into app/components/downloaded/
+        when it is dragged or placed onto the viewport. Returns True if newly persisted.
+        """
+        if type_id in self._components:
+            return False
+        preview = self._previews.get(type_id)
+        if preview is None or not isinstance(preview, FritzingComponentDef):
+            return False
+        save_downloaded_part(preview)
+        self.register(preview)
+        for cb in list(self._install_listeners):
+            try:
+                cb(type_id)
+            except Exception:
+                pass
+        return True
+
     def get(self, type_id: str) -> Optional[ComponentDef]:
-        return self._components.get(type_id)
+        return self._components.get(type_id) or self._previews.get(type_id)
 
     def get_all(self) -> list[ComponentDef]:
         return list(self._components.values())

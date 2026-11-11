@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-def rotate_point_cw(x: int, y: int, rotation: int) -> tuple[int, int]:
+def rotate_point_cw(x: int | float, y: int | float, rotation: int) -> tuple[int | float, int | float]:
     """
     Rotates relative grid coordinates clockwise by 0, 90, 180, or 270 degrees.
     Screen coordinate system: +X right, +Y down.
@@ -39,7 +39,7 @@ class PlacedComponent:
 
     def get_pin_positions(self, comp_def) -> list[tuple[str, int, int, str]]:
         """
-        Returns list of (pin_name, abs_col, abs_row, pin_type) for each pin.
+        Returns list of (pin_name, abs_col, abs_row, pin_type) for each perfboard-hole pin.
         """
         pins = comp_def.get_pins_for_instance(self)
         result = []
@@ -47,5 +47,19 @@ class PlacedComponent:
             rx, ry = rotate_point_cw(p.grid_x, p.grid_y, self.rotation)
             abs_col = self.grid_x + rx
             abs_row = self.grid_y + ry
+            result.append((p.name, abs_col, abs_row, p.pin_type))
+        return result
+
+    def get_off_grid_pin_positions(self, comp_def) -> list[tuple[str, float, float, str]]:
+        """
+        Returns list of (pin_name, abs_col_f, abs_row_f, pin_type) for each jumper-only off-grid pin.
+        """
+        if not hasattr(comp_def, "get_off_grid_pins_for_instance"):
+            return []
+        result = []
+        for p in comp_def.get_off_grid_pins_for_instance(self):
+            rx, ry = rotate_point_cw(p.offset_x, p.offset_y, self.rotation)
+            abs_col = float(self.grid_x) + float(rx)
+            abs_row = float(self.grid_y) + float(ry)
             result.append((p.name, abs_col, abs_row, p.pin_type))
         return result

@@ -57,6 +57,7 @@ class ComponentItem(QGraphicsItem):
         self.prepareGeometryChange()
         self.instance.rotate_cw()
         self.update()
+        self._notify_live_move()
         self._notify_undo_change()
 
     def rotate_ccw(self):
@@ -64,6 +65,7 @@ class ComponentItem(QGraphicsItem):
         self.prepareGeometryChange()
         self.instance.rotate_ccw()
         self.update()
+        self._notify_live_move()
         self._notify_undo_change()
 
     def set_rotation(self, angle: int):
@@ -71,6 +73,7 @@ class ComponentItem(QGraphicsItem):
         self.prepareGeometryChange()
         self.instance.rotation = angle % 360
         self.update()
+        self._notify_live_move()
         self._notify_undo_change()
 
     def shape(self) -> QPainterPath:
@@ -163,8 +166,8 @@ class ComponentItem(QGraphicsItem):
         p = self.config.pitch_px
         pins = self.instance.get_pin_positions(self.comp_def)
         matched_pin = None
+        matched_off_grid = None
 
-        is_bottom = (self.config.view_side == "bottom")
         for pin_name, abs_col, abs_row, ptype in pins:
             px, py = self.config.grid_to_board_pos(abs_col, abs_row)
             item_pin_pos = self.mapFromScene(QPointF(px, py))
@@ -173,10 +176,22 @@ class ComponentItem(QGraphicsItem):
                 matched_pin = (pin_name, abs_col, abs_row, ptype)
                 break
 
+        if not matched_pin:
+            for pin_name, abs_col_f, abs_row_f, ptype in self.instance.get_off_grid_pin_positions(self.comp_def):
+                px, py = self.config.grid_to_board_pos(abs_col_f, abs_row_f)
+                item_pin_pos = self.mapFromScene(QPointF(px, py))
+                dist = (item_pin_pos.x() - local_pos.x())**2 + (item_pin_pos.y() - local_pos.y())**2
+                if dist < (p * 0.55)**2:
+                    matched_off_grid = (pin_name, ptype)
+                    break
+
         if matched_pin:
             name, c, r, ptype = matched_pin
             col_letter = col_index_to_name(c)
             self.setToolTip(f"{self.comp_def.name}: Pin {name} ({ptype})\nHole: {col_letter}{r + 1} (Col: {c}, Row: {r})")
+        elif matched_off_grid:
+            name, ptype = matched_off_grid
+            self.setToolTip(f"{self.comp_def.name}: Pin {name} ({ptype})\nOff-grid (Jumper-only: solder a jumper wire to perfboard)")
         else:
             self.setToolTip(f"{self.comp_def.name} [{self.instance.label}]\nPos: ({self.instance.grid_x}, {self.instance.grid_y}) | Rot: {self.instance.rotation}°")
 

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QGroupBox, QGridLayout,
     QApplication, QInputDialog, QMessageBox, QSplitter, QSizePolicy
 )
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtGui import QColor, QFont, QCursor
 from PyQt6.QtCore import Qt, pyqtSignal, QSettings
 from app.models.board import BoardConfig, col_index_to_name
 from app.models.placed_component import PlacedComponent
@@ -493,11 +493,15 @@ class PropertiesWidget(QWidget):
         i_layout = QVBoxLayout(info_grp)
         i_layout.setSpacing(6)
 
-        c1_name = col_index_to_name(j.start_col)
-        c2_name = col_index_to_name(j.end_col)
+        def _fmt_end(col, row, pin_ref):
+            if pin_ref is not None:
+                return f"Pin {pin_ref[2]} [Jumper-Only]"
+            c_idx = int(round(col))
+            r_idx = int(round(row))
+            return f"{col_index_to_name(c_idx)}{r_idx + 1} (Col: {c_idx}, Row: {r_idx})"
 
-        start_str = f"From: {c1_name}{j.start_row + 1} (Col: {j.start_col}, Row: {j.start_row})"
-        end_str = f"To:   {c2_name}{j.end_row + 1} (Col: {j.end_col}, Row: {j.end_row})"
+        start_str = f"From: {_fmt_end(j.start_col, j.start_row, j.start_pin)}"
+        end_str = f"To:   {_fmt_end(j.end_col, j.end_row, j.end_pin)}"
         len_str = f"Length: {j.length_holes:.2f} holes ({j.length_mm:.1f} mm)"
 
         for t in (start_str, end_str, len_str):
@@ -808,7 +812,9 @@ class PropertiesWidget(QWidget):
         pins_layout = QVBoxLayout(pins_grp)
 
         pins = inst.get_pin_positions(comp_def)
-        table = QTableWidget(len(pins), 3)
+        off_pins = inst.get_off_grid_pin_positions(comp_def)
+        total_rows = len(pins) + len(off_pins)
+        table = QTableWidget(total_rows, 3)
         table.setHorizontalHeaderLabels(["Pin", "Hole", "Type"])
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -816,7 +822,7 @@ class PropertiesWidget(QWidget):
         table.verticalHeader().setVisible(False)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setMaximumHeight(min(220, len(pins) * 28 + 32))
+        table.setMaximumHeight(min(220, total_rows * 28 + 32))
 
         for row, (pname, c, r, ptype) in enumerate(pins):
             c_name = col_index_to_name(c)
@@ -828,6 +834,17 @@ class PropertiesWidget(QWidget):
 
             if not self.config.is_valid_hole(c, r):
                 item_hole.setForeground(Qt.GlobalColor.red)
+
+            table.setItem(row, 0, item_name)
+            table.setItem(row, 1, item_hole)
+            table.setItem(row, 2, item_type)
+
+        for idx, (pname, _cf, _rf, ptype) in enumerate(off_pins):
+            row = len(pins) + idx
+            item_name = QTableWidgetItem(pname)
+            item_hole = QTableWidgetItem("Jumper Only (Off-Grid)")
+            item_hole.setForeground(QColor("#fd7e14"))
+            item_type = QTableWidgetItem(ptype)
 
             table.setItem(row, 0, item_name)
             table.setItem(row, 1, item_hole)
@@ -868,6 +885,7 @@ class PropertiesWidget(QWidget):
             self.selected_item.instance.grid_y = self.spin_y.value()
             self.selected_item.update_position_from_grid()
             self.selected_item.refresh_geometry()
+            self.selected_item._notify_live_move()
             self.property_changed.emit()
 
     def _on_rotation_changed(self, idx: int):
