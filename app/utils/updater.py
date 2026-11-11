@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from decimal import Decimal
 from typing import Callable
 
 GITHUB_OWNER = "KayraKocak"
@@ -58,24 +59,28 @@ def normalize_version_str(raw: str | None) -> str | None:
     return m.group(1)
 
 
-def parse_version(version_str: str | None) -> tuple[int, ...]:
-    """Parses a dotted numeric version string into an integer tuple."""
+def parse_version(version_str: str | None) -> tuple[int, Decimal, tuple[int, ...]]:
+    """
+    Parses a dotted numeric version string as (major, Decimal('0.<minor>'), extra_ints)
+    so decimal-style versions like '0.01' < '0.1' < '2.72' < '12.2' compare accurately.
+    """
     norm = normalize_version_str(version_str)
     if not norm:
-        return (0,)
-    return tuple(int(part) for part in norm.split("."))
+        return (0, Decimal("0"), ())
+    parts = norm.split(".")
+    major = int(parts[0])
+    minor = Decimal(f"0.{parts[1]}") if len(parts) > 1 else Decimal("0")
+    extra = [int(p) for p in parts[2:]]
+    while extra and extra[-1] == 0:
+        extra.pop()
+    return (major, minor, tuple(extra))
 
 
 def is_newer_version(remote_ver: str | None, local_ver: str | None) -> bool:
     """Returns True if remote_ver represents a strictly newer version than local_ver."""
     if not normalize_version_str(remote_ver):
         return False
-    r_parts = parse_version(remote_ver)
-    l_parts = parse_version(local_ver)
-    max_len = max(len(r_parts), len(l_parts))
-    r_padded = r_parts + (0,) * (max_len - len(r_parts))
-    l_padded = l_parts + (0,) * (max_len - len(l_parts))
-    return r_padded > l_padded
+    return parse_version(remote_ver) > parse_version(local_ver)
 
 
 def get_local_version(version_path: str = LOCAL_VERSION_PATH) -> str:
