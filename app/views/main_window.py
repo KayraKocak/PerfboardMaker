@@ -3,21 +3,32 @@ Main application window for PerfBoardMaker with viewport toolbar and mode handli
 Supports .pbrd file saving/loading and 200-step undo/redo.
 """
 import os
+import shutil
+import threading
 from PyQt6.QtWidgets import (
-    QMainWindow, QToolBar, QStatusBar, QLabel, QDockWidget, QFileDialog,
+    QApplication, QMainWindow, QToolBar, QStatusBar, QLabel, QDockWidget, QFileDialog,
     QMessageBox, QInputDialog, QComboBox, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolButton, QSplitter, QSplitterHandle, QPushButton, QMenu, QWidgetAction
+    QToolButton, QSplitter, QSplitterHandle, QPushButton, QMenu, QWidgetAction,
+    QProgressDialog,
 )
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QPixmap, QPainter, QColor
-from PyQt6.QtCore import Qt, QSize, QRectF, QTimer, QSettings, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QRectF, QTimer, QSettings, QObject, pyqtSignal
 from app.models.board import BoardConfig, col_index_to_name
 from app.models.project import PROJECT_FILE_EXTENSION, PROJECT_FILE_FILTER, load_project_file
 from app.utils.autosave import save_autosave_snapshot, get_latest_autosave_file, get_all_autosave_files, AUTOSAVES_DIR
 from app.utils.logger import check_crash_log, clear_crash_log, write_no_crash, log_action
+from app.utils.updater import (
+    fetch_remote_version,
+    get_local_version,
+    is_newer_version,
+    download_and_stage_update,
+    launch_detached_updater,
+)
 from app.views.canvas_view import CanvasView
 from app.views.toolbox_widget import ToolboxWidget
 from app.views.properties_widget import PropertiesWidget
 from app.views.viewport_toolbar import ViewportToolbar
+from app.views.update_button import RainbowUpdateButton
 from app.views.styles import DARK_THEME
 
 VALID_BOARD_THEMES = ("green", "brown", "blue", "black")
@@ -112,6 +123,13 @@ BOARD_PRESETS = {
     "Large (48 x 32)": (48, 32),
     "Eurocard (60 x 40)": (60, 40),
 }
+
+class _UpdateSignals(QObject):
+    update_available = pyqtSignal(str, str)  # (local_ver, remote_ver)
+    download_progress = pyqtSignal(int, int)  # (downloaded_bytes, total_bytes)
+    download_finished = pyqtSignal(str, str)  # (staged_repo_root, temp_base_dir)
+    download_failed = pyqtSignal(str)
+
 
 class MainWindow(QMainWindow):
     @staticmethod
@@ -287,6 +305,20 @@ class MainWindow(QMainWindow):
 
         # Check crash log and recover session if needed
         QTimer.singleShot(100, self._check_crash_recovery)
+
+        # Startup update check from GitHub
+        self._local_version = get_local_version()
+        self._remote_version: str | None = None
+        self._updating_exit = False
+        self._update_in_progress = False
+        self._update_cancel_event: threading.Event | None = None
+        self._update_progress_dlg: QProgressDialog | None = None
+        self._update_signals = _UpdateSignals(self)
+        self._update_signals.update_available.connect(self._on_update_available)
+        self._update_signals.download_progress.connect(self._on_download_progress)
+        self._update_signals.download_finished.connect(self._on_download_finished)
+        self._update_signals.download_failed.connect(self._on_download_failed)
+        QTimer.singleShot(350, self._start_update_check)
 
         # Fit board after initial window show & layout completes
         self._initial_fit_done = False
@@ -569,26 +601,41 @@ class MainWindow(QMainWindow):
 
     def _build_statusbar(self):
         sb = self.statusBar()
+        sb.setMinimumHeight(30)
 
         self.lbl_mode = QLabel("[MODE: SELECT (1)]")
-        self.lbl_mode.setMinimumWidth(180)
+        self.lbl_mode.setMinimumWidth(145)
         self.lbl_mode.setStyleSheet("font-weight: bold; color: #5865f2;")
         sb.addWidget(self.lbl_mode)
 
         self.lbl_hole_coord = QLabel("Hole: --")
-        self.lbl_hole_coord.setMinimumWidth(180)
+        self.lbl_hole_coord.setMinimumWidth(95)
         sb.addWidget(self.lbl_hole_coord)
 
         self.lbl_view_side = QLabel("[TOP VIEW - Component Side]")
-        self.lbl_view_side.setMinimumWidth(220)
+        self.lbl_view_side.setMinimumWidth(175)
         self.lbl_view_side.setStyleSheet("font-weight: bold; color: #5865f2;")
         sb.addWidget(self.lbl_view_side)
 
         self.lbl_comp_count = QLabel("Components: 0 | Jumpers: 0")
-        self.lbl_comp_count.setMinimumWidth(200)
+        self.lbl_comp_count.setMinimumWidth(165)
         sb.addWidget(self.lbl_comp_count)
 
-        sb.addPermanentWidget(QLabel("1: Select | 2: Solder | 3: Jumper | 4: AutoConnect | Ctrl+G: Group | Enter: Connect | F: Flip"))
+        # Center area for update notification button
+        self._sb_left_spacer = QWidget(sb)
+        self._sb_left_spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        sb.addWidget(self._sb_left_spacer, 1)
+
+        self.btn_update = RainbowUpdateButton("Newer Version Found", sb)
+        self.btn_update.setVisible(False)
+        self.btn_update.clicked.connect(self._on_update_button_clicked)
+        sb.addWidget(self.btn_update, 0)
+
+        self._sb_right_spacer = QWidget(sb)
+        self._sb_right_spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        sb.addWidget(self._sb_right_spacer, 8)
+
+        sb.addPermanentWidget(QLabel("1-4: Modes | Ctrl+G: Group | Enter: Connect | F: Flip"))
 
     def _update_mode_status(self, mode: str):
         mode_titles = {
@@ -993,6 +1040,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.canvas.zoom_to_fit)
 
     def closeEvent(self, event):
+        if self._updating_exit:
+            write_no_crash()
+            event.accept()
+            return
         if self._maybe_save():
             self._save_last_board_theme(self.config.style)
             # Perform final autosave if project was modified
@@ -1133,3 +1184,172 @@ class MainWindow(QMainWindow):
 
         pix.save(path)
         QMessageBox.information(self, "Export Complete", f"Perfboard layout successfully exported to:\n{path}")
+
+    # --- AUTO-UPDATE FROM GITHUB ---
+    def _start_update_check(self):
+        local_ver = self._local_version
+
+        def _worker():
+            remote_ver = fetch_remote_version()
+            if remote_ver and is_newer_version(remote_ver, local_ver):
+                try:
+                    self._update_signals.update_available.emit(local_ver, remote_ver)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=_worker, name="PerfBoardUpdaterCheck", daemon=True).start()
+
+    def _on_update_available(self, local_ver: str, remote_ver: str):
+        self._local_version = local_ver
+        self._remote_version = remote_ver
+        self.btn_update.setToolTip(
+            f"Newer Version Found: v{remote_ver} (Current: v{local_ver})\n"
+            f"Click to download and replace files directly in the app folder."
+        )
+        self.btn_update.setVisible(True)
+        log_action("Update available", f"local={local_ver}, remote={remote_ver}")
+
+    def _on_update_button_clicked(self):
+        if self._update_in_progress:
+            return
+        remote_ver = self._remote_version or "latest"
+        ans = QMessageBox.question(
+            self,
+            "Newer Version Found",
+            f"A newer version of PerfBoardMaker is available on GitHub!\n\n"
+            f"Installed version: v{self._local_version}\n"
+            f"Latest version: v{remote_ver}\n\n"
+            f"Do you want to download it and replace the old files in the app folder now?\n"
+            f"The application will restart automatically after updating.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        if not self._maybe_save():
+            return
+
+        self._update_in_progress = True
+        self.btn_update.setEnabled(False)
+        self._update_cancel_event = threading.Event()
+
+        dlg = QProgressDialog("Downloading update from GitHub...", "Cancel", 0, 100, self)
+        dlg.setWindowTitle("Updating PerfBoardMaker")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.canceled.connect(self._on_update_download_canceled)
+        dlg.show()
+        self._update_progress_dlg = dlg
+
+        cancel_ev = self._update_cancel_event
+
+        def _download_worker():
+            try:
+                def _on_prog(downloaded: int, total: int):
+                    try:
+                        self._update_signals.download_progress.emit(downloaded, total)
+                    except RuntimeError:
+                        pass
+
+                staged_root, temp_dir = download_and_stage_update(
+                    progress_cb=_on_prog,
+                    cancel_event=cancel_ev,
+                )
+                try:
+                    self._update_signals.download_finished.emit(staged_root, temp_dir)
+                except RuntimeError:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except InterruptedError:
+                try:
+                    self._update_signals.download_failed.emit("__CANCELLED__")
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                try:
+                    self._update_signals.download_failed.emit(str(exc))
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=_download_worker, name="PerfBoardUpdaterDownload", daemon=True).start()
+
+    def _on_update_download_canceled(self):
+        if self._update_cancel_event is not None:
+            self._update_cancel_event.set()
+
+    def _on_download_progress(self, downloaded: int, total: int):
+        dlg = self._update_progress_dlg
+        if dlg is None:
+            return
+        if total > 0:
+            if dlg.maximum() == 0:
+                dlg.setRange(0, 100)
+            pct = max(0, min(100, int((downloaded * 100) / total)))
+            dlg.setValue(pct)
+            dlg.setLabelText(
+                f"Downloading update from GitHub... {downloaded // 1024} KB / {total // 1024} KB"
+            )
+        else:
+            if dlg.maximum() != 0:
+                dlg.setRange(0, 0)
+            dlg.setLabelText(f"Downloading update from GitHub... ({downloaded // 1024} KB)")
+
+    def _on_download_finished(self, staged_repo_root: str, temp_base_dir: str):
+        if self._update_progress_dlg is not None:
+            self._update_progress_dlg.close()
+            self._update_progress_dlg.deleteLater()
+            self._update_progress_dlg = None
+
+        if self._update_cancel_event is not None and self._update_cancel_event.is_set():
+            shutil.rmtree(temp_base_dir, ignore_errors=True)
+            self._update_in_progress = False
+            self.btn_update.setEnabled(True)
+            return
+
+        log_action("Applying update from GitHub", f"target_ver={self._remote_version}")
+        self._save_last_board_theme(self.config.style)
+        try:
+            self._perform_autosave()
+        except Exception:
+            pass
+        write_no_crash()
+
+        try:
+            launch_detached_updater(
+                staged_repo_root=staged_repo_root,
+                temp_base_dir=temp_base_dir,
+                parent_pid=os.getpid(),
+                relaunch_app=True,
+            )
+        except Exception as exc:
+            shutil.rmtree(temp_base_dir, ignore_errors=True)
+            self._update_in_progress = False
+            self.btn_update.setEnabled(True)
+            QMessageBox.critical(self, "Update Error", f"Failed to launch updater:\n{exc}")
+            return
+
+        self._updating_exit = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_download_failed(self, err_msg: str):
+        if self._update_progress_dlg is not None:
+            self._update_progress_dlg.close()
+            self._update_progress_dlg.deleteLater()
+            self._update_progress_dlg = None
+
+        self._update_in_progress = False
+        self.btn_update.setEnabled(True)
+        if err_msg == "__CANCELLED__":
+            self.statusBar().showMessage("Update download cancelled.", 3000)
+            return
+        QMessageBox.warning(
+            self,
+            "Update Failed",
+            f"Could not download the latest version from GitHub:\n\n{err_msg}",
+        )
+
