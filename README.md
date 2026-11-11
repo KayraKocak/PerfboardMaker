@@ -86,6 +86,6 @@ python run.py
 Or on Windows, double-click `start.bat`.
 
 
-##LICENSE
+## LICENSE
 
 This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License — see the LICENSE file for details. You are free to use and customize this app, but commercial use or selling it is not permitted.
