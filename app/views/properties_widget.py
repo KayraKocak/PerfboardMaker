@@ -7,15 +7,17 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
     QAbstractSpinBox, QToolButton, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QGroupBox, QGridLayout,
-    QApplication, QInputDialog, QMessageBox, QSplitter, QSizePolicy, QButtonGroup, QCheckBox
+    QApplication, QInputDialog, QMessageBox, QSplitter, QSizePolicy, QButtonGroup, QCheckBox,
+    QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QColor, QFont, QCursor
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings
+from PyQt6.QtGui import QColor, QFont, QCursor, QIcon, QPainter, QPixmap, QPen
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QSize, QRectF
 from app.models.board import BoardConfig, BoardCutout, col_index_to_name
 from app.models.placed_component import PlacedComponent
 from app.models.solder import SelectedSolderPath
 from app.models.jumper import JumperWire, JUMPER_COLORS, DEFAULT_JUMPER_COLOR
 from app.models.router import AutoConnectSettings, AutoConnectTarget, AutoConnectGroup
+from app.components.registry import REGISTRY
 from app.views.component_item import ComponentItem
 from app.views.jumper_item import JumperItem
 from app.views.slideable_number_box import SlideableNumberBox
@@ -156,6 +158,12 @@ class PropertiesWidget(QWidget):
     cutout_modified = pyqtSignal()                      # Selected cutout edited from inspector
     cutout_delete_requested = pyqtSignal(str)           # Delete cutout by uid
     cutouts_clear_requested = pyqtSignal()              # Clear all cutouts
+    component_selected = pyqtSignal(object)             # Emitted when a component is clicked in the content browser
+    component_visibility_toggled = pyqtSignal(object, bool)   # comp, visible
+    collection_visibility_toggled = pyqtSignal(bool)          # visible
+    solders_visibility_toggled = pyqtSignal(bool)             # visible
+    jumpers_visibility_toggled = pyqtSignal(bool)             # visible
+    board_visibility_toggled = pyqtSignal(bool)               # visible
 
     def __init__(self, config: BoardConfig, parent=None):
         super().__init__(parent)
@@ -163,6 +171,15 @@ class PropertiesWidget(QWidget):
         self.selected_item = None
         self.active_mode = "select"
         self.active_jumper_color = DEFAULT_JUMPER_COLOR
+        self.components: list[PlacedComponent] = []
+
+        # Content Browser state
+        self.collection_collapsed: bool = False
+        self.collection_visible: bool = True
+        self.solders_visible: bool = True
+        self.jumpers_visible: bool = True
+        self.board_visible: bool = True
+        self.hidden_component_uids: set[str] = set()
 
         # Shape Perfboard tool state
         self.active_cutout_shape: str = "rect"
@@ -245,17 +262,56 @@ class PropertiesWidget(QWidget):
 
         self.splitter.addWidget(self.top_panel)
         self.splitter.addWidget(self.bottom_panel)
-        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.bottom_panel.hide()
+        self._content_browser_height: int = 320
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
 
         main_layout.addWidget(self.splitter)
 
         self.refresh_view()
 
+    def _on_splitter_moved(self, pos: int, index: int):
+        if self.active_mode in ("select", "jumper", "solder"):
+            sizes = self.splitter.sizes()
+            if sizes and sizes[0] > 0:
+                self._content_browser_height = sizes[0]
+
+    def _apply_content_browser_height(self):
+        if not self.bottom_panel.isVisible():
+            return
+        total = sum(self.splitter.sizes())
+        if total <= 0:
+            total = self.splitter.height()
+        if total > 0 and self._content_browser_height > 0:
+            target_top = min(self._content_browser_height, max(60, total - 60))
+            self.splitter.setSizes([target_top, max(1, total - target_top)])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.active_mode in ("select", "jumper", "solder"):
+            self._apply_content_browser_height()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.active_mode in ("select", "jumper", "solder"):
+            self._apply_content_browser_height()
+
     def set_mode(self, mode: str):
+        prev_mode = self.active_mode
+        if prev_mode in ("select", "jumper", "solder"):
+            sizes = self.splitter.sizes()
+            if sizes and sizes[0] > 0:
+                self._content_browser_height = sizes[0]
+
         self.active_mode = mode
-        self._refresh_tool_panel()
+
+        if mode in ("select", "jumper", "solder") and prev_mode in ("select", "jumper", "solder"):
+            pass
+        else:
+            self._refresh_tool_panel()
+
+        self._refresh_object_panel()
 
     def set_active_jumper_color(self, hex_color: str):
         self.active_jumper_color = hex_color
@@ -267,6 +323,24 @@ class PropertiesWidget(QWidget):
             return
         self.selected_item = item
         self._refresh_object_panel()
+        self._sync_content_browser_selection()
+
+    def _sync_content_browser_selection(self):
+        if not hasattr(self, "comp_list_widget"):
+            return
+        target_inst = self.selected_item.instance if isinstance(self.selected_item, ComponentItem) else None
+        self.comp_list_widget.blockSignals(True)
+        try:
+            for i in range(self.comp_list_widget.count()):
+                w_item = self.comp_list_widget.item(i)
+                comp = w_item.data(Qt.ItemDataRole.UserRole)
+                if comp is not None and comp is target_inst:
+                    w_item.setSelected(True)
+                    self.comp_list_widget.setCurrentItem(w_item)
+                else:
+                    w_item.setSelected(False)
+        finally:
+            self.comp_list_widget.blockSignals(False)
 
     def set_autoconnect_targets(self, targets: list[AutoConnectTarget]):
         self.autoconnect_targets = list(targets)
@@ -284,6 +358,32 @@ class PropertiesWidget(QWidget):
             else:
                 self._refresh_tool_panel()
 
+    def set_components(self, components: list[PlacedComponent]):
+        self.components = list(components)
+        if self.active_mode in ("select", "jumper", "solder"):
+            if hasattr(self, "comp_list_widget"):
+                self._populate_components_list()
+                count = len(self.components)
+                if hasattr(self, "collection_title_lbl"):
+                    self.collection_title_lbl.setText(f"Components Collection ({count})")
+                if hasattr(self, "collection_summary_lbl"):
+                    count_text = f"{count} Placed Component" + ("s" if count != 1 else "")
+                    self.collection_summary_lbl.setText(count_text)
+                self._apply_content_browser_height()
+            else:
+                self._refresh_tool_panel()
+
+    def reset_visibility_states(self):
+        """Resets all visibility flags to True (called on unhide all)."""
+        self.collection_visible = True
+        self.solders_visible = True
+        self.jumpers_visible = True
+        self.board_visible = True
+        self.hidden_component_uids.clear()
+        if self.active_mode in ("select", "jumper", "solder"):
+            self._refresh_tool_panel()
+            self._apply_content_browser_height()
+
     def set_selected_cutout(self, uid: str | None):
         self.selected_cutout_uid = uid
         if self.active_mode == "shape":
@@ -295,10 +395,8 @@ class PropertiesWidget(QWidget):
 
     def _refresh_tool_panel(self):
         self._clear_tool_layout()
-        if self.active_mode == "jumper":
-            self.show_jumper_tool_settings()
-        elif self.active_mode == "solder":
-            self.show_solder_tool_settings()
+        if self.active_mode in ("select", "jumper", "solder"):
+            self.show_content_browser()
         elif self.active_mode == "autoconnect":
             self.show_autoconnect_settings()
         elif self.active_mode == "shape":
@@ -315,7 +413,19 @@ class PropertiesWidget(QWidget):
         elif isinstance(self.selected_item, SelectedSolderPath):
             self.show_solder_path_properties(self.selected_item)
         else:
-            self.bottom_panel.hide()
+            if self.active_mode in ("select", "jumper", "solder"):
+                self.bottom_panel.show()
+                self.obj_title_lbl.setText("SELECTED OBJECT")
+                placeholder = QLabel("No object selected.\n\nClick a component, jumper, or solder path to view its properties.")
+                placeholder.setWordWrap(True)
+                placeholder.setStyleSheet("color: #80848e; font-size: 11px; padding: 12px 6px;")
+                self.obj_layout.addWidget(placeholder)
+                self.obj_layout.addStretch()
+            else:
+                self.bottom_panel.hide()
+
+        if self.active_mode in ("select", "jumper", "solder"):
+            self._apply_content_browser_height()
 
     def _clear_qlayout(self, layout):
         while layout.count():
@@ -328,10 +438,9 @@ class PropertiesWidget(QWidget):
     def _clear_tool_layout(self):
         while QApplication.overrideCursor() is not None:
             QApplication.restoreOverrideCursor()
-        if hasattr(self, "sel_targets_layout"):
-            delattr(self, "sel_targets_layout")
-        if hasattr(self, "sel_targets_grp"):
-            delattr(self, "sel_targets_grp")
+        for attr in ("sel_targets_layout", "sel_targets_grp", "comp_list_widget", "collection_title_lbl", "collection_summary_lbl"):
+            if hasattr(self, attr):
+                delattr(self, attr)
         self._clear_qlayout(self.layout)
 
     def _clear_object_layout(self):
@@ -635,6 +744,346 @@ class PropertiesWidget(QWidget):
 
         self.layout.addWidget(grp)
         self.layout.addStretch()
+
+    # Content Browser (Components Collection in Select, Jumper, and Solder modes)
+    def _create_eye_icon(self, hidden: bool, size: int = 18) -> QIcon:
+        """Draws an eye icon 👁, with a 45-degree crossing line when hidden."""
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        font = QFont("Segoe UI Emoji", int(size * 0.65))
+        p.setFont(font)
+        p.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "👁")
+
+        if hidden:
+            pen = QPen(QColor(235, 75, 75), 2.0)
+            p.setPen(pen)
+            margin = size * 0.15
+            p.drawLine(int(margin), int(size - margin), int(size - margin), int(margin))
+
+        p.end()
+        return QIcon(pix)
+
+    def _make_eye_button(self, hidden: bool) -> QToolButton:
+        btn = QToolButton()
+        btn.setIcon(self._create_eye_icon(hidden))
+        btn.setIconSize(QSize(18, 18))
+        btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn.setToolTip("Click to toggle visibility")
+        btn.setStyleSheet(
+            "QToolButton { background-color: transparent; border: none; padding: 2px; border-radius: 3px; } "
+            "QToolButton:hover { background-color: #35373c; }"
+        )
+        return btn
+
+    def show_content_browser(self):
+        self.title_lbl.setText("CONTENT BROWSER")
+
+        count = len(self.components)
+        count_text = f"{count} Placed Component" + ("s" if count != 1 else "")
+
+        # --- 1. Components Collection (Collapsible) ---
+        col_grp = QGroupBox()
+        col_grp.setStyleSheet(
+            "QGroupBox { font-weight: bold; color: #5865f2; border: 1px solid #3f4249; "
+            "border-radius: 6px; margin-top: 6px; padding: 6px; background-color: #1e1f22; }"
+        )
+        col_main_layout = QVBoxLayout(col_grp)
+        col_main_layout.setContentsMargins(6, 6, 6, 6)
+        col_main_layout.setSpacing(6)
+
+        # Header: Arrow/Collapse button + Title + Eye button
+        header_widget = QWidget()
+        h_layout = QHBoxLayout(header_widget)
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        h_layout.setSpacing(6)
+
+        self.btn_collapse_col = QToolButton()
+        arrow_char = "▶" if self.collection_collapsed else "▼"
+        self.btn_collapse_col.setText(arrow_char)
+        self.btn_collapse_col.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_collapse_col.setStyleSheet(
+            "QToolButton { background: transparent; border: none; color: #5865f2; font-size: 11px; font-weight: bold; } "
+            "QToolButton:hover { color: #7983f5; }"
+        )
+        self.btn_collapse_col.clicked.connect(self._toggle_collection_collapse)
+        h_layout.addWidget(self.btn_collapse_col)
+
+        title_lbl = QLabel(f"Components Collection ({count})")
+        title_lbl.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        title_lbl.setStyleSheet("color: #5865f2;")
+        title_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        title_lbl.mousePressEvent = lambda e: self._toggle_collection_collapse()
+        h_layout.addWidget(title_lbl, 1)
+        self.collection_title_lbl = title_lbl
+
+        self.btn_eye_collection = self._make_eye_button(not self.collection_visible)
+        self.btn_eye_collection.clicked.connect(self._toggle_collection_visibility)
+        h_layout.addWidget(self.btn_eye_collection)
+
+        col_main_layout.addWidget(header_widget)
+
+        # Body container (collapsible)
+        self.collection_body = QWidget()
+        b_layout = QVBoxLayout(self.collection_body)
+        b_layout.setContentsMargins(0, 4, 0, 0)
+        b_layout.setSpacing(6)
+
+        # Search / filter field
+        self.comp_filter_edit = QLineEdit()
+        self.comp_filter_edit.setPlaceholderText("Filter components...")
+        self.comp_filter_edit.setClearButtonEnabled(True)
+        self.comp_filter_edit.setStyleSheet(
+            "QLineEdit { background-color: #2b2d31; color: #dbdee1; border: 1px solid #3f4249; "
+            "border-radius: 4px; padding: 4px 8px; font-size: 11px; } "
+            "QLineEdit:focus { border: 1px solid #5865f2; }"
+        )
+        b_layout.addWidget(self.comp_filter_edit)
+
+        # Components List
+        self.comp_list_widget = QListWidget()
+        self.comp_list_widget.setFrameShape(QFrame.Shape.NoFrame)
+        self.comp_list_widget.setStyleSheet(
+            "QListWidget { background-color: #2b2d31; border: 1px solid #383a40; border-radius: 4px; outline: none; } "
+            "QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #35373c; color: #dbdee1; } "
+            "QListWidget::item:hover { background-color: #35373c; } "
+            "QListWidget::item:selected { background-color: #3f4249; color: #ffffff; font-weight: bold; border-left: 3px solid #5865f2; }"
+        )
+        self.comp_list_widget.setMinimumHeight(160)
+
+        # Populate items
+        self._populate_components_list()
+
+        self.comp_filter_edit.textChanged.connect(self._filter_components_list)
+        self.comp_list_widget.itemClicked.connect(self._on_component_item_clicked)
+
+        b_layout.addWidget(self.comp_list_widget)
+
+        # Summary label
+        summary_lbl = QLabel(count_text)
+        summary_lbl.setStyleSheet("color: #949ba4; font-size: 11px;")
+        b_layout.addWidget(summary_lbl)
+        self.collection_summary_lbl = summary_lbl
+
+        col_main_layout.addWidget(self.collection_body)
+        self.collection_body.setVisible(not self.collection_collapsed)
+
+        self.layout.addWidget(col_grp)
+
+        # --- 2. Independent Rows under Collection (Solders, Jumpers, Perfboard) ---
+        layers_grp = QGroupBox("Layers")
+        layers_grp.setStyleSheet(
+            "QGroupBox { font-weight: bold; color: #b5bac1; border: 1px solid #3f4249; "
+            "border-radius: 6px; margin-top: 6px; padding: 6px; background-color: #1e1f22; }"
+        )
+        layers_layout = QVBoxLayout(layers_grp)
+        layers_layout.setContentsMargins(4, 8, 4, 4)
+        layers_layout.setSpacing(4)
+
+        # Row 1: Solders
+        row_solders = self._create_layer_row(
+            icon_text="⚡", title="Solders", count_label=None,
+            hidden=not self.solders_visible,
+            on_toggle=self._toggle_solders_visibility
+        )
+        layers_layout.addWidget(row_solders)
+
+        # Row 2: Jumpers
+        row_jumpers = self._create_layer_row(
+            icon_text="〰️", title="Jumpers", count_label=None,
+            hidden=not self.jumpers_visible,
+            on_toggle=self._toggle_jumpers_visibility
+        )
+        layers_layout.addWidget(row_jumpers)
+
+        # Row 3: Perfboard
+        row_board = self._create_layer_row(
+            icon_text="▦", title="Perfboard", count_label=None,
+            hidden=not self.board_visible,
+            on_toggle=self._toggle_board_visibility
+        )
+        layers_layout.addWidget(row_board)
+
+        self.layout.addWidget(layers_grp)
+        self.layout.addStretch()
+        self._apply_content_browser_height()
+
+    def _create_layer_row(self, icon_text: str, title: str, count_label: str | None, hidden: bool, on_toggle) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("QWidget { background-color: #2b2d31; border-radius: 4px; padding: 2px; }")
+        h = QHBoxLayout(w)
+        h.setContentsMargins(8, 4, 6, 4)
+        h.setSpacing(8)
+
+        icon_lbl = QLabel(icon_text)
+        icon_lbl.setStyleSheet("font-size: 13px; color: #dbdee1;")
+        h.addWidget(icon_lbl)
+
+        txt_lbl = QLabel(title)
+        txt_lbl.setFont(QFont("Arial", 9, QFont.Weight.Medium))
+        txt_lbl.setStyleSheet("color: #dbdee1;")
+        h.addWidget(txt_lbl, 1)
+
+        eye_btn = self._make_eye_button(hidden)
+        eye_btn.clicked.connect(lambda: on_toggle(eye_btn))
+        h.addWidget(eye_btn)
+        return w
+
+    def _toggle_collection_collapse(self):
+        self.collection_collapsed = not self.collection_collapsed
+        if hasattr(self, "collection_body"):
+            self.collection_body.setVisible(not self.collection_collapsed)
+        if hasattr(self, "btn_collapse_col"):
+            self.btn_collapse_col.setText("▶" if self.collection_collapsed else "▼")
+        self._apply_content_browser_height()
+
+    def _toggle_collection_visibility(self):
+        self.collection_visible = not self.collection_visible
+        if hasattr(self, "btn_eye_collection"):
+            self.btn_eye_collection.setIcon(self._create_eye_icon(not self.collection_visible))
+        self.collection_visibility_toggled.emit(self.collection_visible)
+
+    def _toggle_solders_visibility(self, btn: QToolButton):
+        self.solders_visible = not self.solders_visible
+        btn.setIcon(self._create_eye_icon(not self.solders_visible))
+        self.solders_visibility_toggled.emit(self.solders_visible)
+
+    def _toggle_jumpers_visibility(self, btn: QToolButton):
+        self.jumpers_visible = not self.jumpers_visible
+        btn.setIcon(self._create_eye_icon(not self.jumpers_visible))
+        self.jumpers_visibility_toggled.emit(self.jumpers_visible)
+
+    def _toggle_board_visibility(self, btn: QToolButton):
+        self.board_visible = not self.board_visible
+        btn.setIcon(self._create_eye_icon(not self.board_visible))
+        self.board_visibility_toggled.emit(self.board_visible)
+
+    def _toggle_single_component_visibility(self, comp: PlacedComponent, eye_btn: QToolButton):
+        if comp.uid in self.hidden_component_uids:
+            self.hidden_component_uids.remove(comp.uid)
+            visible = True
+        else:
+            self.hidden_component_uids.add(comp.uid)
+            visible = False
+        eye_btn.setIcon(self._create_eye_icon(not visible))
+        self.component_visibility_toggled.emit(comp, visible)
+
+    def _render_comp_thumbnail(self, comp_def, pitch: float = 12.0) -> QIcon:
+        """Renders a small crisp preview thumbnail icon for a component."""
+        dummy = PlacedComponent(type_id=comp_def.type_id, grid_x=0, grid_y=0)
+        shape = comp_def.get_shape(dummy, pitch)
+        br = shape.boundingRect()
+        margin = 4.0
+        w = max(24, int(round(br.width() + margin * 2)))
+        h = max(24, int(round(br.height() + margin * 2)))
+        pix = QPixmap(w, h)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.translate(-br.left() + margin, -br.top() + margin)
+        try:
+            comp_def.draw_top(p, dummy, pitch)
+        except Exception:
+            pass
+        p.end()
+        return QIcon(pix)
+
+    def _populate_components_list(self):
+        if not hasattr(self, "comp_list_widget"):
+            return
+        self.comp_list_widget.clear()
+        if not self.components:
+            item = QListWidgetItem("No components placed on board")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setForeground(QColor(148, 155, 164))
+            self.comp_list_widget.addItem(item)
+            return
+
+        selected_instance = None
+        if isinstance(self.selected_item, ComponentItem):
+            selected_instance = self.selected_item.instance
+
+        for comp in self.components:
+            comp_def = REGISTRY.get(comp.type_id)
+            type_name = comp_def.name if comp_def else comp.type_id
+            label_str = comp.label.strip() if comp.label else comp.type_id
+            pos_str = f"{col_index_to_name(comp.grid_x)}{comp.grid_y + 1}"
+
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, comp)
+
+            # Custom item widget with preview icon, text, and eye toggle button
+            row_widget = QWidget()
+            row_widget.setStyleSheet("background: transparent;")
+            r_layout = QHBoxLayout(row_widget)
+            r_layout.setContentsMargins(2, 2, 2, 2)
+            r_layout.setSpacing(6)
+
+            # Thumbnail
+            icon_lbl = QLabel()
+            if comp_def:
+                try:
+                    icon_pix = self._render_comp_thumbnail(comp_def, pitch=10.0).pixmap(22, 22)
+                    icon_lbl.setPixmap(icon_pix)
+                except Exception:
+                    pass
+            icon_lbl.setFixedSize(22, 22)
+            r_layout.addWidget(icon_lbl)
+
+            # Label + details
+            txt_box = QWidget()
+            txt_box.setStyleSheet("background: transparent;")
+            tb_layout = QVBoxLayout(txt_box)
+            tb_layout.setContentsMargins(0, 0, 0, 0)
+            tb_layout.setSpacing(1)
+
+            title_lbl = QLabel(f"{label_str} — {type_name}")
+            title_lbl.setStyleSheet("font-weight: bold; color: #dbdee1; font-size: 11px;")
+            tb_layout.addWidget(title_lbl)
+
+            sub_lbl = QLabel(f"Pos: {pos_str} (col {comp.grid_x}, row {comp.grid_y}) | Rot: {comp.rotation}°")
+            sub_lbl.setStyleSheet("color: #949ba4; font-size: 10px;")
+            tb_layout.addWidget(sub_lbl)
+
+            r_layout.addWidget(txt_box, 1)
+
+            # Individual eye button
+            is_comp_hidden = (comp.uid in self.hidden_component_uids)
+            eye_btn = self._make_eye_button(is_comp_hidden)
+            eye_btn.clicked.connect(lambda checked, c=comp, b=eye_btn: self._toggle_single_component_visibility(c, b))
+            r_layout.addWidget(eye_btn)
+
+            item.setSizeHint(row_widget.sizeHint())
+            self.comp_list_widget.addItem(item)
+            self.comp_list_widget.setItemWidget(item, row_widget)
+
+            if comp is selected_instance:
+                item.setSelected(True)
+                self.comp_list_widget.setCurrentItem(item)
+
+    def _filter_components_list(self, query: str):
+        if not hasattr(self, "comp_list_widget"):
+            return
+        q = query.strip().lower()
+        for i in range(self.comp_list_widget.count()):
+            item = self.comp_list_widget.item(i)
+            comp = item.data(Qt.ItemDataRole.UserRole)
+            if comp is None:
+                continue
+            comp_def = REGISTRY.get(comp.type_id)
+            type_name = comp_def.name.lower() if comp_def else ""
+            label_str = (comp.label or "").lower()
+            pos_str = f"{col_index_to_name(comp.grid_x)}{comp.grid_y + 1}".lower()
+            matches = (q in label_str or q in type_name or q in comp.type_id.lower() or q in pos_str)
+            item.setHidden(not matches)
+
+    def _on_component_item_clicked(self, item: QListWidgetItem):
+        comp = item.data(Qt.ItemDataRole.UserRole)
+        if comp is not None:
+            self.component_selected.emit(comp)
 
     # Board Properties (when no item selected in select mode)
     def show_board_properties(self):

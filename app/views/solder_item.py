@@ -16,14 +16,21 @@ class SolderItem(QGraphicsItem):
         self.solder_mgr = solder_mgr
         self.config = config
         self.is_solder_mode = False
+        self.board_visible = True
         self.highlighted_traces: list[SolderTrace] = []
         self.selected_traces: list[SolderTrace] = []
+        self.hidden_trace_ids: set[int] = set()
         self.current_drawing_segment: tuple[tuple[int, int], tuple[int, int]] | None = None
 
         self.setZValue(4)
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self.config.width_px, self.config.height_px)
+
+    def set_board_visible(self, visible: bool):
+        if self.board_visible != visible:
+            self.board_visible = visible
+            self.update()
 
     def set_solder_mode(self, active: bool):
         if self.is_solder_mode != active:
@@ -91,40 +98,52 @@ class SolderItem(QGraphicsItem):
         cfg = self.config
         is_bottom = (cfg.view_side == "bottom")
         is_transparent = bool(getattr(cfg, "transparent", False))
+        board_hidden = not getattr(self, "board_visible", True)
 
-        # In top view: render if solder mode is ACTIVE (ghost) OR Transparent mode is ON (real back-side solder)
-        if not is_bottom and not self.is_solder_mode and not is_transparent:
+        # In top view: render if solder mode is ACTIVE (ghost) OR Transparent mode is ON (real back-side solder) OR board is HIDDEN
+        if not is_bottom and not self.is_solder_mode and not is_transparent and not board_hidden:
             return
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        segments = list(self.solder_mgr.get_all_segments())
+        if self.hidden_trace_ids:
+            visible_traces = [t for t in self.solder_mgr.traces if t.id not in self.hidden_trace_ids]
+            segments = [seg for t in visible_traces for seg in t.segments]
+            visible_holes = {h for t in visible_traces for h in t.holes}
+            highlighted = [t for t in self.highlighted_traces if t.id not in self.hidden_trace_ids]
+            selected = [t for t in self.selected_traces if t.id not in self.hidden_trace_ids]
+        else:
+            segments = list(self.solder_mgr.get_all_segments())
+            visible_holes = self.solder_mgr.get_all_holes()
+            highlighted = self.highlighted_traces
+            selected = self.selected_traces
+
         if self.current_drawing_segment:
             segments.append(self.current_drawing_segment)
 
-        if not segments and not self.solder_mgr.get_all_holes():
+        if not segments and not visible_holes:
             painter.restore()
             return
 
         pad_r = cfg.pad_radius_px * 0.85
         solder_stroke_w = pad_r * 1.8
 
-        if is_bottom or is_transparent:
-            # --- REALISTIC SOLDER (BACK SIDE, OR THROUGH-BOARD IN TRANSPARENT FRONT VIEW) ---
+        if is_bottom or is_transparent or board_hidden:
+            # --- REALISTIC SOLDER (BACK SIDE, OR THROUGH-BOARD IN TRANSPARENT FRONT VIEW, OR WHEN BOARD IS HIDDEN) ---
 
             # 0a. Glowing Net Highlight (when hovering in selection mode)
-            if self.highlighted_traces:
+            if highlighted:
                 self._draw_trace_halo(
-                    painter, self.highlighted_traces,
+                    painter, highlighted,
                     QColor(255, 215, 0, 130), solder_stroke_w + 8.0, pad_r + 4.0,
                     QColor(255, 255, 140, 230), solder_stroke_w + 3.0,
                 )
 
             # 0b. Persistent Selection Halo (when a solder path is selected)
-            if self.selected_traces:
+            if selected:
                 self._draw_trace_halo(
-                    painter, self.selected_traces,
+                    painter, selected,
                     QColor(88, 101, 242, 175), solder_stroke_w + 10.5, pad_r + 5.2,
                     QColor(56, 189, 248, 240), solder_stroke_w + 5.0,
                 )
@@ -140,7 +159,7 @@ class SolderItem(QGraphicsItem):
 
             # Draw pads for all soldered holes
             painter.setPen(Qt.PenStyle.NoPen)
-            for col, row in self.solder_mgr.get_all_holes():
+            for col, row in visible_holes:
                 px, py = cfg.grid_to_board_pos(col, row)
                 painter.setBrush(QColor(140, 145, 155))
                 painter.drawEllipse(QPointF(px, py), pad_r, pad_r)
@@ -154,7 +173,7 @@ class SolderItem(QGraphicsItem):
                 p2 = QPointF(*cfg.grid_to_board_pos(*h2))
                 painter.drawLine(p1, p2)
 
-            for col, row in self.solder_mgr.get_all_holes():
+            for col, row in visible_holes:
                 px, py = cfg.grid_to_board_pos(col, row)
                 solder_grad = QRadialGradient(px - pad_r * 0.3, py - pad_r * 0.3, pad_r)
                 solder_grad.setColorAt(0.0, QColor(250, 252, 255))
@@ -175,7 +194,7 @@ class SolderItem(QGraphicsItem):
             # 4. Hole centers: small depression showing soldered connection
             pin_r = cfg.hole_radius_px * 0.7
             painter.setPen(QPen(QColor(80, 85, 95), 0.8))
-            for col, row in self.solder_mgr.get_all_holes():
+            for col, row in visible_holes:
                 px, py = cfg.grid_to_board_pos(col, row)
                 lead_grad = QRadialGradient(px - 0.5, py - 0.5, pin_r)
                 lead_grad.setColorAt(0.0, QColor(240, 240, 250))
@@ -196,7 +215,7 @@ class SolderItem(QGraphicsItem):
 
             painter.setPen(QPen(QColor(100, 210, 255, 180), 1.2))
             painter.setBrush(QColor(80, 190, 240, 60))
-            for col, row in self.solder_mgr.get_all_holes():
+            for col, row in visible_holes:
                 px, py = cfg.grid_to_board_pos(col, row)
                 painter.drawEllipse(QPointF(px, py), pad_r * 0.8, pad_r * 0.8)
 

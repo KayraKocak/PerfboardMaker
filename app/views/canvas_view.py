@@ -86,6 +86,7 @@ class CanvasView(QGraphicsView):
     board_resized = pyqtSignal(int, int)            # cols, rows
     cutout_selection_changed = pyqtSignal(object)   # str uid or None
     cutout_tool_synced = pyqtSignal(str)            # active cutout shape synced back to inspector
+    objects_unhidden = pyqtSignal()                 # emitted when all hidden objects are unhidden
     _clipboard_payload: dict | None = None
 
     def __init__(self, config: BoardConfig, parent=None, primary_view: "CanvasView | None" = None):
@@ -246,7 +247,8 @@ class CanvasView(QGraphicsView):
         partner._sync_from_partner()
 
     def _update_solder_z(self):
-        if self.config.view_side != "bottom" and bool(getattr(self.config, "transparent", False)):
+        board_hidden = not self.board_item.isVisible()
+        if self.config.view_side != "bottom" and bool(getattr(self.config, "transparent", False)) and not board_hidden:
             self.solder_item.setZValue(-1)
         else:
             self.solder_item.setZValue(4)
@@ -365,6 +367,8 @@ class CanvasView(QGraphicsView):
         self.autoconnect_overlay.set_active(self.current_mode == "autoconnect")
         self.autoconnect_overlay.set_selected_targets(self.autoconnect_selected_targets)
         self.autoconnect_overlay.set_groups(self.autoconnect_groups)
+        self.board_item.setVisible(partner.board_item.isVisible())
+        self.solder_item.set_board_visible(partner.board_item.isVisible())
         self._update_solder_z()
         self.reinit_board()
 
@@ -1773,13 +1777,14 @@ class CanvasView(QGraphicsView):
         """Finds a clickable SolderTrace at scene_pos when solder is visible/highlighted."""
         is_bottom = (self.config.view_side == "bottom")
         is_transparent = bool(getattr(self.config, "transparent", False))
-        if not is_bottom and not is_transparent:
+        board_hidden = not self.board_item.isVisible()
+        if not is_bottom and not is_transparent and not board_hidden:
             return None
 
-        # On Front View in Transparent mode, keep front-side components & top jumpers clickable first
+        # On Front View (Transparent mode or Board hidden), keep front-side components & top jumpers clickable first
         if not is_bottom:
             for item in self.scene.items(scene_pos):
-                if isinstance(item, ComponentItem) or (isinstance(item, JumperItem) and item.jumper.side == "top"):
+                if (isinstance(item, ComponentItem) and item.isVisible()) or (isinstance(item, JumperItem) and item.isVisible() and item.jumper.side == "top"):
                     return None
 
         pad_thresh = self.config.pad_radius_px * 1.3
@@ -2648,6 +2653,143 @@ class CanvasView(QGraphicsView):
             self._sync_partner_solder()
             self.record_undo_snapshot()
 
+    def _other_double_view(self):
+        return self._partner_view if self._partner_view is not None else self._primary_view
+
+    def hide_selected_object(self) -> bool:
+        """Hides currently selected component(s), jumper(s), or solder trace in selection mode."""
+        if self.current_mode != "select":
+            return False
+
+        hid_any = False
+        other = self._other_double_view()
+
+        for it in list(self.scene.selectedItems()):
+            if isinstance(it, ComponentItem):
+                it.setSelected(False)
+                it.setVisible(False)
+                hid_any = True
+                if other is not None:
+                    for o_it in other.component_items:
+                        if o_it.instance is it.instance:
+                            o_it.setSelected(False)
+                            o_it.setVisible(False)
+            elif isinstance(it, JumperItem):
+                it.setSelected(False)
+                it.setVisible(False)
+                hid_any = True
+                if other is not None:
+                    for o_it in other.jumper_items:
+                        if o_it.jumper is it.jumper:
+                            o_it.setSelected(False)
+                            o_it.setVisible(False)
+
+        if self._selected_solder_trace is not None:
+            tid = self._selected_solder_trace.id
+            self.solder_item.hidden_trace_ids.add(tid)
+            self.select_solder_trace(None)
+            self._clear_net_highlight()
+            self.solder_item.update()
+            if other is not None:
+                other.solder_item.hidden_trace_ids.add(tid)
+                other.select_solder_trace(None)
+                other._clear_net_highlight()
+                other.solder_item.update()
+            hid_any = True
+
+        if hid_any:
+            self.selection_changed.emit(None)
+            log_action("Hide Object", "selection hidden")
+        return hid_any
+
+    def unhide_all_objects(self) -> int:
+        """Unhides all hidden components, jumpers, and solder traces across all modes."""
+        count = 0
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            for it in view.component_items:
+                if not it.isVisible():
+                    it.setVisible(True)
+                    if view is self:
+                        count += 1
+            for it in view.jumper_items:
+                if not it.isVisible():
+                    it.setVisible(True)
+                    if view is self:
+                        count += 1
+            if not view.solder_item.isVisible():
+                view.solder_item.setVisible(True)
+                if view is self:
+                    count += 1
+            if not view.board_item.isVisible():
+                view.board_item.setVisible(True)
+                view.solder_item.set_board_visible(True)
+                view._update_solder_z()
+                view.solder_item.update()
+                if view is self:
+                    count += 1
+            if view.solder_item.hidden_trace_ids:
+                if view is self:
+                    count += len(view.solder_item.hidden_trace_ids)
+                view.solder_item.hidden_trace_ids.clear()
+                view.solder_item.update()
+
+        if count > 0:
+            self.objects_unhidden.emit()
+            log_action("Unhide All Objects", f"count={count}")
+        return count
+
+    def set_component_visible(self, comp: PlacedComponent, visible: bool):
+        """Sets visibility for a single placed component instance across views."""
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            for it in view.component_items:
+                if it.instance is comp:
+                    if it.isSelected() and not visible:
+                        it.setSelected(False)
+                    it.setVisible(visible)
+
+    def set_collection_visible(self, visible: bool):
+        """Sets visibility for all placed components across views."""
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            for it in view.component_items:
+                if it.isSelected() and not visible:
+                    it.setSelected(False)
+                it.setVisible(visible)
+
+    def set_solders_visible(self, visible: bool):
+        """Sets visibility for all solder traces across views."""
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            view.solder_item.setVisible(visible)
+            if not visible:
+                view.select_solder_trace(None)
+
+    def set_jumpers_visible(self, visible: bool):
+        """Sets visibility for all jumper wires across views."""
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            for it in view.jumper_items:
+                if it.isSelected() and not visible:
+                    it.setSelected(False)
+                it.setVisible(visible)
+
+    def set_board_visible(self, visible: bool):
+        """Sets visibility for the perfboard base item across views."""
+        for view in (self, self._other_double_view()):
+            if view is None:
+                continue
+            view.board_item.setVisible(visible)
+            view.solder_item.set_board_visible(visible)
+            view._update_solder_z()
+            view.solder_item.update()
+
     def get_selected_component_item(self) -> ComponentItem | None:
         items = self.scene.selectedItems()
         for it in items:
@@ -2661,6 +2803,22 @@ class CanvasView(QGraphicsView):
             if isinstance(it, JumperItem):
                 return it
         return None
+
+    def select_component(self, comp: PlacedComponent, ensure_visible: bool = True):
+        """Finds and selects the ComponentItem matching the PlacedComponent instance."""
+        target_item = None
+        for it in self.component_items:
+            if it.instance is comp:
+                target_item = it
+                break
+        if target_item is None:
+            return
+
+        self.scene.clearSelection()
+        target_item.setSelected(True)
+        if ensure_visible:
+            self.ensureVisible(target_item, 50, 50)
+        self.selection_changed.emit(target_item)
 
     def start_placement_mode(self, type_id: str):
         self.set_mode("select")
@@ -3398,9 +3556,10 @@ class CanvasView(QGraphicsView):
             self.placement_ghost.grid_y = row
             self.placement_ghost_item.update_position_from_grid()
 
-        # Selection Mode on Back View (or any side in Transparent Mode): Highlight Entire Conductive Net!
+        # Selection Mode on Back View (or any side in Transparent Mode or when Board is Hidden): Highlight Entire Conductive Net!
+        board_hidden = not self.board_item.isVisible()
         if self.current_mode == "select" and (
-            self.config.view_side == "bottom" or bool(getattr(self.config, "transparent", False))
+            self.config.view_side == "bottom" or bool(getattr(self.config, "transparent", False)) or board_hidden
         ):
             net_traces, net_jumpers = self.get_conductive_net_at(col, row, scene_pos)
             self._apply_net_highlight(net_traces, net_jumpers)
@@ -3783,6 +3942,15 @@ class CanvasView(QGraphicsView):
             self.toggle_view_side()
             event.accept()
             return
+        elif key == Qt.Key.Key_H:
+            if modifiers & Qt.KeyboardModifier.AltModifier:
+                self.unhide_all_objects()
+                event.accept()
+                return
+            if not (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
+                if self.hide_selected_object():
+                    event.accept()
+                    return
         elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.remove_selected_item()
             event.accept()

@@ -28,6 +28,7 @@ from app.views.canvas_view import CanvasView
 from app.views.toolbox_widget import ToolboxWidget
 from app.views.properties_widget import PropertiesWidget
 from app.views.viewport_toolbar import ViewportToolbar
+from app.views.export_dialog import ExportImageDialog
 from app.views.update_button import RainbowUpdateButton
 from app.views.styles import DARK_THEME
 
@@ -349,6 +350,7 @@ class MainWindow(QMainWindow):
             cv.autoconnect_completed.connect(self._on_autoconnect_completed)
             cv.cutout_selection_changed.connect(self.properties.set_selected_cutout)
             cv.cutout_tool_synced.connect(self._on_canvas_cutout_tool_synced)
+            cv.objects_unhidden.connect(self.properties.reset_visibility_states)
 
         self.canvas.view_side_changed.connect(self._on_view_side_changed)
 
@@ -366,6 +368,12 @@ class MainWindow(QMainWindow):
         self.properties.property_changed.connect(self._on_property_changed)
         self.properties.board_changed.connect(self._on_board_settings_changed)
         self.properties.delete_requested.connect(self.canvas.remove_selected_item)
+        self.properties.component_selected.connect(self.canvas.select_component)
+        self.properties.component_visibility_toggled.connect(self.canvas.set_component_visible)
+        self.properties.collection_visibility_toggled.connect(self.canvas.set_collection_visible)
+        self.properties.solders_visibility_toggled.connect(self.canvas.set_solders_visible)
+        self.properties.jumpers_visibility_toggled.connect(self.canvas.set_jumpers_visible)
+        self.properties.board_visibility_toggled.connect(self.canvas.set_board_visible)
 
         # AutoConnect triggers
         self.properties.connect_requested.connect(self.canvas.perform_autoconnect)
@@ -540,6 +548,12 @@ class MainWindow(QMainWindow):
         self.act_zoom_fit.triggered.connect(self.canvas.zoom_to_fit)
         view_menu.addAction(self.act_zoom_fit)
 
+        self.act_unhide_all = QAction("👁️ Unhide All Objects", self)
+        self.act_unhide_all.setShortcut(QKeySequence("Alt+H"))
+        self.act_unhide_all.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.act_unhide_all.triggered.connect(self.canvas.unhide_all_objects)
+        view_menu.addAction(self.act_unhide_all)
+
         view_menu.addSeparator()
 
         self.act_mode_select = QAction("Select Mode (1)", self)
@@ -568,13 +582,6 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(18, 18))
         self.addToolBar(tb)
 
-        # File actions
-        tb.addAction(self.act_new)
-        tb.addAction(self.act_open)
-        tb.addAction(self.act_save)
-
-        tb.addSeparator()
-
         # Undo / Redo actions
         tb.addAction(self.act_undo)
         tb.addAction(self.act_redo)
@@ -583,12 +590,6 @@ class MainWindow(QMainWindow):
 
         # Flip View Button (Top vs Bottom)
         tb.addAction(self.act_flip)
-
-        self.btn_view_indicator = QToolButton()
-        self.btn_view_indicator.setText("👁️ VIEW: TOP (Components)")
-        self.btn_view_indicator.setStyleSheet("font-weight: bold; color: #5865f2; background-color: #2b2d31;")
-        self.btn_view_indicator.clicked.connect(self.canvas.toggle_view_side)
-        tb.addWidget(self.btn_view_indicator)
 
         tb.addSeparator()
 
@@ -599,8 +600,6 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # Zoom Controls
-        tb.addAction(self.act_zoom_in)
-        tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_fit)
 
         tb.addSeparator()
@@ -785,9 +784,6 @@ class MainWindow(QMainWindow):
             self.viewport_splitter.setSizes([half_w, total_w - half_w])
 
             self.act_flip.setEnabled(False)
-            self.btn_view_indicator.setEnabled(False)
-            self.btn_view_indicator.setText("👁️ VIEW: FRONT + BACK (Double)")
-            self.btn_view_indicator.setStyleSheet("font-weight: bold; color: #7983f5; background-color: #2b2d31;")
             left_is_front = (self.viewport_splitter.widget(0) is self.canvas)
             order_lbl = "Front | Back" if left_is_front else "Back | Front"
             self.lbl_view_side.setText(f"[DOUBLE VIEW - {order_lbl}]")
@@ -803,7 +799,6 @@ class MainWindow(QMainWindow):
             self.canvas_back.hide()
 
             self.act_flip.setEnabled(True)
-            self.btn_view_indicator.setEnabled(True)
             self._on_view_side_changed(self.config.view_side)
             QTimer.singleShot(0, self.canvas.zoom_to_fit)
 
@@ -813,12 +808,8 @@ class MainWindow(QMainWindow):
         if self.btn_double_view.isChecked():
             return
         if side == "top":
-            self.btn_view_indicator.setText("👁️ VIEW: TOP (Components)")
-            self.btn_view_indicator.setStyleSheet("font-weight: bold; color: #5865f2; background-color: #2b2d31;")
             self.lbl_view_side.setText("[TOP VIEW - Component Side]")
         else:
-            self.btn_view_indicator.setText("👁️ VIEW: BOTTOM (Solder Side)")
-            self.btn_view_indicator.setStyleSheet("font-weight: bold; color: #f0b232; background-color: #2b2d31;")
             self.lbl_view_side.setText("[BOTTOM VIEW - Solder Side]")
 
     def _on_component_placed(self, comp):
@@ -884,6 +875,7 @@ class MainWindow(QMainWindow):
         c_cnt = len(self.canvas.placed_components)
         j_cnt = len(self.canvas.jumpers)
         self.lbl_comp_count.setText(f"Components: {c_cnt} | Jumpers: {j_cnt}")
+        self.properties.set_components(self.canvas.placed_components)
 
     def _on_preset_size_changed(self, idx: int):
         text = self.combo_presets.currentText()
@@ -1210,14 +1202,34 @@ class MainWindow(QMainWindow):
             self.canvas.record_undo_snapshot()
 
     def _export_image(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Board Image", "perfboard.png", "PNG Images (*.png);;All Files (*)")
+        dlg = ExportImageDialog(self.config.width_px, self.config.height_px, parent=self)
+        if dlg.exec() != ExportImageDialog.DialogCode.Accepted:
+            return
+
+        settings = dlg.get_settings()
+        fmt = settings["format"]
+        ext_map = {
+            "PNG": ("png", "PNG Images (*.png);;All Files (*)"),
+            "JPEG": ("jpg", "JPEG Images (*.jpg *.jpeg);;All Files (*)"),
+            "WebP": ("webp", "WebP Images (*.webp);;All Files (*)"),
+        }
+        default_ext, file_filter = ext_map[fmt]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Board Image", f"perfboard.{default_ext}", file_filter
+        )
         if not path:
             return
 
-        w = int(self.config.width_px)
-        h = int(self.config.height_px)
+        w = settings["width"]
+        h = settings["height"]
         pix = QPixmap(w, h)
-        pix.fill(QColor(24, 25, 28))
+        bg = settings["background"]
+        if bg == "transparent":
+            pix.fill(Qt.GlobalColor.transparent)
+        elif bg == "white":
+            pix.fill(QColor(255, 255, 255))
+        else:
+            pix.fill(QColor(24, 25, 28))
 
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1227,7 +1239,10 @@ class MainWindow(QMainWindow):
         self.canvas.scene.render(painter, target=QRectF(pix.rect()), source=self.canvas.board_item.boundingRect())
         painter.end()
 
-        pix.save(path)
+        save_quality = -1 if fmt == "PNG" else settings["quality"]
+        if not pix.save(path, fmt, save_quality):
+            QMessageBox.warning(self, "Export Failed", f"Could not save image to:\n{path}")
+            return
         QMessageBox.information(self, "Export Complete", f"Perfboard layout successfully exported to:\n{path}")
 
     # --- AUTO-UPDATE FROM GITHUB ---
