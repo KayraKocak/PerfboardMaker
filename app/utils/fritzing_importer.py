@@ -502,6 +502,47 @@ def _classify_pin_type(name: str, conn_type: str) -> str:
     return "io"
 
 
+_MAX_LOCAL_FILE_BYTES = 25 * 1024 * 1024
+
+
+def _read_fzpz_bytes(data: bytes) -> tuple[bytes, bytes]:
+    """Extracts (.fzp bytes, breadboard .svg bytes) from .fzpz archive bytes."""
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        infos = {info.filename: info for info in zf.infolist()}
+        names = list(infos.keys())
+        fzp_names = [n for n in names if n.lower().endswith(".fzp")]
+        if not fzp_names:
+            raise ValueError("Missing .fzp inside .fzpz archive")
+        fzp_name = fzp_names[0]
+        if infos[fzp_name].file_size > _MAX_LOCAL_FILE_BYTES:
+            raise ValueError("Fritzing .fzp entry is too large")
+        fzp_bytes = zf.read(fzp_name)
+        fzp_root = ET.fromstring(fzp_bytes)
+        bb_layers = fzp_root.find("./views/breadboardView/layers")
+        if bb_layers is None or not bb_layers.get("image"):
+            raise ValueError("Part has no breadboard view")
+        bb_img = bb_layers.get("image", "")
+        expected_svg_name = "svg." + bb_img.replace("/", ".")
+        svg_name = None
+        if expected_svg_name in infos:
+            svg_name = expected_svg_name
+        else:
+            base_name = os.path.basename(bb_img).lower()
+            matches = [
+                n for n in names
+                if n.lower().endswith(".svg") and (
+                    n.lower().endswith(base_name) or "breadboard" in n.lower()
+                )
+            ]
+            if matches:
+                svg_name = matches[0]
+        if svg_name is None:
+            raise ValueError("Missing breadboard .svg inside .fzpz archive")
+        if infos[svg_name].file_size > _MAX_LOCAL_FILE_BYTES:
+            raise ValueError("Breadboard .svg entry is too large")
+        return fzp_bytes, zf.read(svg_name)
+
+
 def _download_candidate_files(entry: FritzingCatalogEntry) -> tuple[bytes, bytes]:
     """Downloads (.fzp bytes, breadboard .svg bytes) for a FritzingCatalogEntry."""
     encoded_path = urllib.parse.quote(entry.path, safe="/")
@@ -509,34 +550,7 @@ def _download_candidate_files(entry: FritzingCatalogEntry) -> tuple[bytes, bytes
     data = _http_get_bytes(raw_url, timeout=10.0)
 
     if entry.kind == "fzpz":
-        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-            names = zf.namelist()
-            fzp_names = [n for n in names if n.lower().endswith(".fzp")]
-            if not fzp_names:
-                raise ValueError("Missing .fzp inside .fzpz archive")
-            fzp_bytes = zf.read(fzp_names[0])
-            fzp_root = ET.fromstring(fzp_bytes)
-            bb_layers = fzp_root.find("./views/breadboardView/layers")
-            if bb_layers is None or not bb_layers.get("image"):
-                raise ValueError("Part has no breadboard view")
-            bb_img = bb_layers.get("image", "")
-            expected_svg_name = "svg." + bb_img.replace("/", ".")
-            svg_name = None
-            if expected_svg_name in names:
-                svg_name = expected_svg_name
-            else:
-                base_name = os.path.basename(bb_img).lower()
-                matches = [
-                    n for n in names
-                    if n.lower().endswith(".svg") and (
-                        n.lower().endswith(base_name) or "breadboard" in n.lower()
-                    )
-                ]
-                if matches:
-                    svg_name = matches[0]
-            if svg_name is None:
-                raise ValueError("Missing breadboard .svg inside .fzpz archive")
-            return fzp_bytes, zf.read(svg_name)
+        return _read_fzpz_bytes(data)
 
     # core_fzp
     fzp_bytes = data
@@ -659,52 +673,54 @@ def parse_and_validate_fritzing_part(
 
     best_score, best_aligned, raw_connectors, svg_w_mm, svg_h_mm, best_unbused = best_result
     total_conns = len(vb_connectors)
-    if not best_aligned:
-        return None, "No pins align to 2.54 mm grid"
-    if total_conns < 12:
-        if best_unbused:
-            return None, "Has electrical pins not aligned to 2.54 mm grid"
-    else:
-        if len(best_aligned) * 2 < total_conns or len(best_unbused) > 10:
-            return None, "Too many pins not aligned to 2.54 mm grid"
 
-    # Deduplicate holes if same bus overlaps, reject if different signals occupy the same hole
-    kept_indices = sorted(best_aligned.keys())
-    occupied_holes: dict[tuple[int, int], str] = {}
+    use_aligned = total_conns == 1 or len(best_aligned) >= 2
     final_items: list[tuple[tuple[str, str, str, str, float, float], int, int]] = []
+    if use_aligned and best_aligned:
+        kept_indices = sorted(best_aligned.keys())
+        occupied_holes: dict[tuple[int, int], str] = {}
+        base_gx, base_gy = best_aligned[kept_indices[0]]
+        anchor_x_mm = raw_connectors[kept_indices[0]][4]
+        anchor_y_mm = raw_connectors[kept_indices[0]][5]
 
-    base_gx, base_gy = best_aligned[kept_indices[0]]
-    anchor_x_mm = raw_connectors[kept_indices[0]][4]
-    anchor_y_mm = raw_connectors[kept_indices[0]][5]
+        for j in kept_indices:
+            item = raw_connectors[j]
+            cid = item[0]
+            gx = best_aligned[j][0] - base_gx
+            gy = best_aligned[j][1] - base_gy
+            hole = (gx, gy)
+            if hole in occupied_holes:
+                other_cid = occupied_holes[hole]
+                if other_cid in bus_adj.get(cid, set()):
+                    continue
+                # Fine-pitch collision: fall back to completely unaligned jumper-only part
+                use_aligned = False
+                final_items.clear()
+                break
+            occupied_holes[hole] = cid
+            final_items.append((item, gx, gy))
 
-    for j in kept_indices:
-        item = raw_connectors[j]
-        cid = item[0]
-        gx = best_aligned[j][0] - base_gx
-        gy = best_aligned[j][1] - base_gy
-        hole = (gx, gy)
-        if hole in occupied_holes:
-            other_cid = occupied_holes[hole]
-            if other_cid in bus_adj.get(cid, set()):
-                continue
-            return None, "Two independent pins map onto the same perfboard hole"
-        occupied_holes[hole] = cid
-        final_items.append((item, gx, gy))
-
-    pins = [
-        PinDef(
-            name=entry_item[0][1],
-            grid_x=entry_item[1],
-            grid_y=entry_item[2],
-            description=entry_item[0][3],
-            pin_type=entry_item[0][2],
-        )
-        for entry_item in final_items
-    ]
+    if use_aligned and final_items:
+        pins = [
+            PinDef(
+                name=entry_item[0][1],
+                grid_x=entry_item[1],
+                grid_y=entry_item[2],
+                description=entry_item[0][3],
+                pin_type=entry_item[0][2],
+            )
+            for entry_item in final_items
+        ]
+        off_grid_indices = [j for j in range(len(raw_connectors)) if j not in best_aligned]
+    else:
+        pins = []
+        anchor_x_mm = raw_connectors[0][4]
+        anchor_y_mm = raw_connectors[0][5]
+        off_grid_indices = list(range(len(raw_connectors)))
 
     off_grid_pins: list[OffGridPinDef] = []
     seen_off_grid_pos: set[tuple[float, float]] = set()
-    for j in best_unbused:
+    for j in off_grid_indices:
         item = raw_connectors[j]
         ox = round((item[4] - anchor_x_mm) / _MM_PER_HOLE, 4)
         oy = round((item[5] - anchor_y_mm) / _MM_PER_HOLE, 4)
@@ -726,7 +742,7 @@ def parse_and_validate_fritzing_part(
     title = (fzp_root.findtext("title") or entry.display_name).strip()
     label = (fzp_root.findtext("label") or "U").strip() or "U"
     author = (fzp_root.findtext("author") or entry.source_name).strip()
-    url = (fzp_root.findtext("url") or f"https://github.com/{entry.repo}").strip()
+    url = (fzp_root.findtext("url") or (f"https://github.com/{entry.repo}" if entry.repo else "")).strip()
     raw_desc = (fzp_root.findtext("description") or "").strip()
     clean_desc = re.sub(r"<[^>]+>", " ", raw_desc)
     clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
@@ -736,7 +752,12 @@ def parse_and_validate_fritzing_part(
             tags.append(extra)
 
     attr_line = f"Source: {entry.source_name} ({author})"
-    if off_grid_pins:
+    if not pins and off_grid_pins:
+        attr_line += (
+            f"\nUnaligned part ({len(off_grid_pins)} pins): pins cannot be aligned with the "
+            f"perfboard and are only connectable via jumpers."
+        )
+    elif off_grid_pins:
         attr_line += f"\nJumper-only off-grid pins ({len(off_grid_pins)}): cannot plug into holes; connect via jumper wires."
     full_desc = f"{clean_desc}\n\n{attr_line}".strip() if clean_desc else attr_line
 
@@ -760,12 +781,82 @@ def parse_and_validate_fritzing_part(
             "path": entry.path,
             "author": author,
             "url": url,
-            "license": "CC BY-SA",
+            "license": "CC BY-SA" if entry.repo else "Unknown",
         },
         is_remote_preview=True,
         off_grid_pins=off_grid_pins,
     )
     return comp_def, None
+
+
+def _read_local_fzp_with_svg(fzp_path: str) -> tuple[bytes, bytes]:
+    """Reads a loose .fzp and locates its breadboard SVG next to it or in a fritzing-parts tree."""
+    with open(fzp_path, "rb") as f:
+        fzp_bytes = f.read()
+    fzp_root = ET.fromstring(fzp_bytes)
+    bb_layers = fzp_root.find("./views/breadboardView/layers")
+    if bb_layers is None or not bb_layers.get("image"):
+        raise ValueError("Part has no breadboard view")
+
+    raw_img = bb_layers.get("image", "").replace("\\", "/").lstrip("/")
+    if not raw_img or ".." in raw_img.split("/"):
+        raise ValueError(f"Unsafe breadboard SVG path: {bb_layers.get('image', '')}")
+
+    base_dir = os.path.dirname(os.path.abspath(fzp_path))
+    candidates = [
+        os.path.join(base_dir, raw_img),
+        os.path.join(base_dir, os.path.basename(raw_img)),
+    ]
+    # Support both <root>/{core,pdb}/x.fzp and <root>/pdb/{core,contrib,user,obsolete}/x.fzp
+    parent = os.path.dirname(base_dir)
+    grandparent = os.path.dirname(parent)
+    for root_dir in (parent, grandparent):
+        if not root_dir:
+            continue
+        for sub in ("core", "contrib", "user", "obsolete"):
+            candidates.append(os.path.join(root_dir, "svg", sub, raw_img))
+        candidates.append(os.path.join(root_dir, "svg", raw_img))
+
+    for cand in candidates:
+        if os.path.isfile(cand):
+            if os.path.getsize(cand) > _MAX_LOCAL_FILE_BYTES:
+                raise ValueError("Breadboard SVG file is too large")
+            with open(cand, "rb") as f:
+                return fzp_bytes, f.read()
+    raise ValueError(f"Breadboard SVG '{raw_img}' not found next to the .fzp file")
+
+
+def import_fritzing_file(path: str) -> tuple[FritzingComponentDef | None, str | None]:
+    """
+    Imports a local .fzpz archive, or a .fzp with its breadboard SVG alongside it.
+    Returns (component, None) if 2.54 mm compatible, else (None, reason).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".fzpz", ".fzp"):
+        return None, "Unsupported file type (expected .fzpz or .fzp)"
+    try:
+        if os.path.getsize(path) > _MAX_LOCAL_FILE_BYTES:
+            return None, "File is too large"
+        if ext == ".fzpz":
+            with open(path, "rb") as f:
+                fzp_bytes, svg_bytes = _read_fzpz_bytes(f.read())
+        else:
+            fzp_bytes, svg_bytes = _read_local_fzp_with_svg(path)
+    except (OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return None, str(exc)
+
+    stem = re.sub(r"[^a-zA-Z0-9]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("_").lower()[:36] or "part"
+    digest = hashlib.sha1(fzp_bytes + svg_bytes).hexdigest()[:8]
+    entry = FritzingCatalogEntry(
+        source_name="Local",
+        repo="",
+        branch="",
+        kind="fzpz" if ext == ".fzpz" else "local_fzp",
+        path=os.path.abspath(path),
+        display_name=_clean_display_name(path),
+        type_id=f"fritzing_{stem}_{digest}",
+    )
+    return parse_and_validate_fritzing_part(entry, fzp_bytes, svg_bytes)
 
 
 def search_compatible_fritzing_parts(

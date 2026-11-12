@@ -557,7 +557,7 @@ class CanvasView(QGraphicsView):
             self.record_undo_snapshot()
 
     def reset_scene_rect(self):
-        margin = 300
+        margin = 1200
         w = self.config.width_px
         h = self.config.height_px
         self.scene.setSceneRect(-margin, -margin, w + 2 * margin, h + 2 * margin)
@@ -2157,10 +2157,9 @@ class CanvasView(QGraphicsView):
         is_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier) or self._shift_pressed
         is_ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier) or self._ctrl_pressed
 
-        # Placement mode click
+        # Placement mode click (allowed both on and outside the perfboard)
         if event.button() == Qt.MouseButton.LeftButton and self.placement_type_id:
-            if self.config.is_valid_hole(col, row):
-                self.add_component(self.placement_type_id, col, row, self.placement_rotation)
+            self.add_component(self.placement_type_id, col, row, self.placement_rotation)
             event.accept()
             return
 
@@ -2809,6 +2808,8 @@ class CanvasView(QGraphicsView):
             if self.config.is_valid_hole(col, row):
                 self.board_item.set_hovered_hole(col, row)
                 self.hover_hole_changed.emit(col, row, col_index_to_name(col))
+            else:
+                self.board_item.set_hovered_hole(-1, -1)
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
@@ -2818,8 +2819,8 @@ class CanvasView(QGraphicsView):
             type_id = event.mimeData().data("application/x-perfboard-component").data().decode("utf-8")
             scene_pos = self.mapToScene(event.position().toPoint())
             col, row = self.config.board_pos_to_grid(scene_pos.x(), scene_pos.y())
-            if self.config.is_valid_hole(col, row):
-                self.add_component(type_id, col, row)
+            self.add_component(type_id, col, row)
+            self.board_item.set_hovered_hole(-1, -1)
             event.acceptProposedAction()
         else:
             super().dropEvent(event)

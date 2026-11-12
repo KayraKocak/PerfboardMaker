@@ -132,12 +132,8 @@ class ComponentItem(QGraphicsItem):
                 self.setZValue(15 if is_selected else 10)
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.scene():
             new_pos = value
-            # Calculate snapped grid coordinate
+            # Calculate snapped grid coordinate (components may also live outside perfboard bounds)
             col, row = self.config.board_pos_to_grid(new_pos.x(), new_pos.y())
-
-            # Clamp within board bounds (with 1 grid unit margin flexibility)
-            col = max(0, min(self.config.cols - 1, col))
-            row = max(0, min(self.config.rows - 1, row))
 
             changed = (col != self.instance.grid_x or row != self.instance.grid_y)
             self.instance.grid_x = col

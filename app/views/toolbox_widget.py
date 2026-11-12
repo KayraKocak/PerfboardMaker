@@ -4,18 +4,20 @@ click-to-place, and debounced online Fritzing compatibility search.
 """
 from __future__ import annotations
 
+import os
 import threading
 from PyQt6.QtCore import Qt, QMimeData, QObject, QPoint, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QDrag, QFont, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QVBoxLayout, QWidget
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget
 )
 
 from app.components.fritzing_part import FritzingComponentDef
 from app.components.registry import REGISTRY
 from app.models.component_def import ComponentDef
 from app.models.placed_component import PlacedComponent
-from app.utils.fritzing_importer import search_compatible_fritzing_parts
+from app.utils.fritzing_importer import import_fritzing_file, search_compatible_fritzing_parts
 
 
 class _OnlineSearchSignals(QObject):
@@ -71,17 +73,28 @@ class ComponentCard(QFrame):
         info_layout.addWidget(title)
 
         off_count = len(getattr(comp_def, "off_grid_pins", []))
-        pin_text = f"{len(comp_def.pins)}+{off_count} jumper pins" if off_count > 0 else f"{len(comp_def.pins)} pins"
-        if is_online and isinstance(comp_def, FritzingComponentDef):
-            src = comp_def.source_info.get("source_name", "Fritzing")
-            sub_text = f"{pin_text} • {src} • Drag to save"
-            sub_color = "#7aa2f7"
+        if len(comp_def.pins) == 0 and off_count > 0:
+            pin_text = f"{off_count} pins • Pins cannot align with perfboard; only connectable via jumpers"
+            if is_online and isinstance(comp_def, FritzingComponentDef):
+                src = comp_def.source_info.get("source_name", "Fritzing")
+                sub_text = f"{pin_text} • {src} • Drag to save"
+                sub_color = "#f0a050"
+            else:
+                sub_text = pin_text
+                sub_color = "#f0a050"
         else:
-            sub_text = f"{pin_text} • {comp_def.default_label}"
-            sub_color = "#949ba4"
+            pin_text = f"{len(comp_def.pins)}+{off_count} jumper pins" if off_count > 0 else f"{len(comp_def.pins)} pins"
+            if is_online and isinstance(comp_def, FritzingComponentDef):
+                src = comp_def.source_info.get("source_name", "Fritzing")
+                sub_text = f"{pin_text} • {src} • Drag to save"
+                sub_color = "#7aa2f7"
+            else:
+                sub_text = f"{pin_text} • {comp_def.default_label}"
+                sub_color = "#949ba4"
 
         desc = QLabel(sub_text)
         desc.setFont(QFont("Arial", 8))
+        desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {sub_color};")
         info_layout.addWidget(desc)
 
@@ -151,6 +164,67 @@ class ComponentCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class _CollapsibleCategory(QWidget):
+    """Collapsible category header + card container for the component toolbox."""
+
+    toggled = pyqtSignal(str, bool)  # (category_name, is_collapsed)
+
+    def __init__(self, category: str, count: int, collapsed: bool = False, parent=None):
+        super().__init__(parent)
+        self.category = category
+        self._total_count = count
+        self._collapsed = collapsed
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.header_btn = QPushButton()
+        self.header_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.header_btn.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.header_btn.setStyleSheet("""
+            QPushButton {
+                color: #5865f2;
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid #383a40;
+                padding: 6px 2px 3px 2px;
+                margin-top: 4px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                color: #7983f5;
+            }
+        """)
+        self.header_btn.clicked.connect(self.toggle)
+        layout.addWidget(self.header_btn)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(8)
+        layout.addWidget(self.content)
+
+        self._apply_state(count)
+
+    def _apply_state(self, visible_count: int):
+        arrow = "▸" if self._collapsed else "▾"
+        self.header_btn.setText(f"{arrow}  {self.category.upper()} ({visible_count})")
+        self.content.setVisible(not self._collapsed)
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def set_collapsed(self, collapsed: bool, visible_count: int | None = None):
+        self._collapsed = bool(collapsed)
+        self._apply_state(self._total_count if visible_count is None else visible_count)
+
+    def toggle(self):
+        self._collapsed = not self._collapsed
+        self._apply_state(self._total_count)
+        self.toggled.emit(self.category, self._collapsed)
+
+
 class ToolboxWidget(QWidget):
     component_selected = pyqtSignal(str)  # type_id to place
 
@@ -177,6 +251,11 @@ class ToolboxWidget(QWidget):
         self.search_box.textChanged.connect(self._on_search_text_changed)
         self.search_box.returnPressed.connect(self._on_search_return_pressed)
         main_layout.addWidget(self.search_box)
+
+        self.import_btn = QPushButton("📂 Import Fritzing part from file...")
+        self.import_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.import_btn.clicked.connect(self._on_import_file_clicked)
+        main_layout.addWidget(self.import_btn)
 
         hint_lbl = QLabel("💡 Drag onto board or click to place. Online compatible parts appear 2s after pausing typing.")
         hint_lbl.setFont(QFont("Arial", 8))
@@ -234,7 +313,9 @@ class ToolboxWidget(QWidget):
         self.list_layout.addWidget(self.online_section)
         self.list_layout.addStretch()
 
-        self.cards: list[tuple[ComponentDef, ComponentCard, QLabel | None]] = []
+        self.cards: list[tuple[ComponentDef, ComponentCard, _CollapsibleCategory]] = []
+        self._category_sections: dict[str, _CollapsibleCategory] = {}
+        self._collapsed_categories: set[str] = set()
         self._online_cards: list[tuple[str, ComponentCard]] = []
         self._populate_components()
 
@@ -264,6 +345,7 @@ class ToolboxWidget(QWidget):
 
     def _populate_components(self):
         self.cards.clear()
+        self._category_sections.clear()
         self._clear_layout(self.local_layout)
         categories = REGISTRY.get_categories()
 
@@ -272,22 +354,26 @@ class ToolboxWidget(QWidget):
             if not comps:
                 continue
 
-            cat_header = QLabel(cat.upper())
-            cat_header.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-            cat_header.setStyleSheet("""
-                color: #5865f2;
-                border-bottom: 1px solid #383a40;
-                padding-top: 6px;
-                padding-bottom: 3px;
-                margin-top: 4px;
-            """)
-            self.local_layout.addWidget(cat_header)
+            section = _CollapsibleCategory(
+                cat,
+                len(comps),
+                collapsed=(cat in self._collapsed_categories),
+            )
+            section.toggled.connect(self._on_category_toggled)
+            self._category_sections[cat] = section
+            self.local_layout.addWidget(section)
 
             for comp in comps:
                 card = ComponentCard(comp, is_online=False)
                 card.clicked.connect(self.component_selected.emit)
-                self.local_layout.addWidget(card)
-                self.cards.append((comp, card, cat_header))
+                section.content_layout.addWidget(card)
+                self.cards.append((comp, card, section))
+
+    def _on_category_toggled(self, category: str, is_collapsed: bool):
+        if is_collapsed:
+            self._collapsed_categories.add(category)
+        else:
+            self._collapsed_categories.discard(category)
 
     def _on_part_permanently_installed(self, type_id: str):
         # Remove from temporary online results list and rebuild local categories
@@ -302,6 +388,37 @@ class ToolboxWidget(QWidget):
 
         self._populate_components()
         self._filter_components(self.search_box.text())
+
+    def _on_import_file_clicked(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Fritzing Part", "",
+            "Fritzing Parts (*.fzpz *.fzp);;All Files (*)",
+        )
+        if not paths:
+            return
+        imported: list[str] = []
+        failures: list[str] = []
+        for path in paths:
+            comp_def, reason = import_fritzing_file(path)
+            name = os.path.basename(path)
+            if comp_def is None:
+                failures.append(f"{name}: {reason}")
+            elif REGISTRY.is_installed(comp_def.type_id):
+                failures.append(f"{name}: already imported")
+            else:
+                REGISTRY.register_preview(comp_def)
+                REGISTRY.persist_if_remote(comp_def.type_id)
+                imported.append(comp_def.name)
+
+        if failures and imported:
+            msg = "Imported:\n" + "\n".join(imported) + "\n\nFailed:\n" + "\n".join(failures)
+            QMessageBox.warning(self, "Import Fritzing Part", msg)
+        elif failures:
+            QMessageBox.warning(self, "Import Fritzing Part", "\n".join(failures))
+        elif imported:
+            QMessageBox.information(
+                self, "Import Fritzing Part", "Imported: " + ", ".join(imported)
+            )
 
     def _on_search_text_changed(self, query: str):
         self._filter_components(query)
@@ -403,7 +520,7 @@ class ToolboxWidget(QWidget):
         query = query.strip().lower()
         visible_in_cat: dict[str, int] = {}
 
-        for comp, card, cat_header in self.cards:
+        for comp, card, _section in self.cards:
             matches = (
                 query in comp.name.lower() or
                 query in comp.category.lower() or
@@ -414,6 +531,11 @@ class ToolboxWidget(QWidget):
             if matches:
                 visible_in_cat[comp.category] = visible_in_cat.get(comp.category, 0) + 1
 
-        for comp, card, cat_header in self.cards:
-            if cat_header:
-                cat_header.setVisible(visible_in_cat.get(comp.category, 0) > 0)
+        for cat, section in self._category_sections.items():
+            vis_count = visible_in_cat.get(cat, 0)
+            section.setVisible(vis_count > 0)
+            if query:
+                if vis_count > 0:
+                    section.set_collapsed(False, visible_count=vis_count)
+            else:
+                section.set_collapsed(cat in self._collapsed_categories)
