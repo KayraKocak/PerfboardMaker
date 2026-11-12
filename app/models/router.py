@@ -1544,6 +1544,8 @@ def extract_connected_pin_groups(
             found = offboard_pin_lookup.get((pin_node[1], pin_node[2]))
             comp = found[0] if found else None
             pname = found[1] if found else fallback_name
+        if comp is None:
+            continue
         if not any(c is comp and n == pname for c, n in pins_by_hole[board_hole]):
             pins_by_hole[board_hole].append((comp, pname))
 
@@ -1577,7 +1579,7 @@ def extract_connected_pin_groups(
             entries = pins_by_hole[h]
             labels = []
             for comp, pname in entries:
-                comp_name = comp.label.strip() if comp.label else comp.type_id
+                comp_name = (comp.label.strip() if comp.label else comp.type_id) if comp is not None else "Unknown"
                 labels.append(f"{comp_name} [{pname}]")
             targets.append(
                 AutoConnectTarget(

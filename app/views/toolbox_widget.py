@@ -17,7 +17,11 @@ from app.components.fritzing_part import FritzingComponentDef
 from app.components.registry import REGISTRY
 from app.models.component_def import ComponentDef
 from app.models.placed_component import PlacedComponent
-from app.utils.fritzing_importer import import_fritzing_file, search_compatible_fritzing_parts
+from app.utils.fritzing_importer import (
+    import_fritzing_file,
+    import_fritzing_file_with_options,
+    search_compatible_fritzing_parts,
+)
 
 
 class _OnlineSearchSignals(QObject):
@@ -27,6 +31,7 @@ class _OnlineSearchSignals(QObject):
 
 class ComponentCard(QFrame):
     clicked = pyqtSignal(str)  # type_id
+    delete_requested = pyqtSignal(str)  # type_id
 
     def __init__(self, comp_def: ComponentDef, is_online: bool = False, parent=None):
         super().__init__(parent)
@@ -99,6 +104,19 @@ class ComponentCard(QFrame):
         info_layout.addWidget(desc)
 
         layout.addLayout(info_layout, 1)
+
+        if not is_online and isinstance(comp_def, FritzingComponentDef):
+            btn_del = QPushButton("✕")
+            btn_del.setFixedSize(18, 18)
+            btn_del.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_del.setToolTip("Delete downloaded component")
+            btn_del.setStyleSheet(
+                "QPushButton { background: transparent; border: none; border-radius: 3px; "
+                "color: #949ba4; font-size: 11px; font-weight: bold; padding: 0px; }"
+                "QPushButton:hover { background-color: #da373c; color: #ffffff; }"
+            )
+            btn_del.clicked.connect(lambda: self.delete_requested.emit(self.comp_def.type_id))
+            layout.addWidget(btn_del, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
 
         self._drag_start_pos = QPoint()
 
@@ -366,8 +384,28 @@ class ToolboxWidget(QWidget):
             for comp in comps:
                 card = ComponentCard(comp, is_online=False)
                 card.clicked.connect(self.component_selected.emit)
+                card.delete_requested.connect(self._on_delete_downloaded_component)
                 section.content_layout.addWidget(card)
                 self.cards.append((comp, card, section))
+
+    def _on_delete_downloaded_component(self, type_id: str):
+        comp = REGISTRY.get(type_id)
+        if comp is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Component",
+            f"Do you want to delete '{comp.name}'?\n\n"
+            "• If you downloaded it using the built-in search box, you can search and download it again anytime.\n\n"
+            "• If you imported it from a file, you will need to import that file again to use it in the future.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if REGISTRY.uninstall_downloaded(type_id):
+            self._populate_components()
+            self._filter_components(self.search_box.text())
 
     def _on_category_toggled(self, category: str, is_collapsed: bool):
         if is_collapsed:
@@ -399,11 +437,40 @@ class ToolboxWidget(QWidget):
         imported: list[str] = []
         failures: list[str] = []
         for path in paths:
-            comp_def, reason = import_fritzing_file(path)
+            orig_comp, scaled_comp, scale_factor, reason = import_fritzing_file_with_options(path)
             name = os.path.basename(path)
-            if comp_def is None:
+            if orig_comp is None:
                 failures.append(f"{name}: {reason}")
-            elif REGISTRY.is_installed(comp_def.type_id):
+                continue
+            comp_def = orig_comp
+            if scaled_comp is not None and scale_factor is not None:
+                total_pins = len(scaled_comp.pins) + len(scaled_comp.off_grid_pins)
+                box = QMessageBox(self)
+                box.setWindowTitle("Scale Unaligned Part?")
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setText(
+                    f"'{orig_comp.name}' has unaligned pins at its original size "
+                    f"({orig_comp.svg_width_mm:.1f} × {orig_comp.svg_height_mm:.1f} mm).\n\n"
+                    f"Scaling by {scale_factor:.2f}× ({scaled_comp.svg_width_mm:.1f} × {scaled_comp.svg_height_mm:.1f} mm) "
+                    f"aligns {len(scaled_comp.pins)}/{total_pins} pins to the 2.54 mm perfboard grid.\n\n"
+                    "Which version would you like to import?"
+                )
+                btn_scaled = box.addButton(
+                    f"Import Scaled ({scale_factor:.2f}×)", QMessageBox.ButtonRole.AcceptRole
+                )
+                btn_orig = box.addButton("Import Original Scale", QMessageBox.ButtonRole.ActionRole)
+                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.setDefaultButton(btn_scaled)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked == btn_scaled:
+                    comp_def = scaled_comp
+                elif clicked == btn_orig:
+                    comp_def = orig_comp
+                else:
+                    continue
+
+            if REGISTRY.is_installed(comp_def.type_id):
                 failures.append(f"{name}: already imported")
             else:
                 REGISTRY.register_preview(comp_def)

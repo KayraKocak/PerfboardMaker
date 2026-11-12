@@ -193,6 +193,46 @@ def save_downloaded_part(
     return json_path
 
 
+def delete_downloaded_part(
+    type_id: str,
+    target_dir: str = DOWNLOADED_PARTS_DIR,
+) -> bool:
+    """Removes persisted .json and .svg files for a downloaded Fritzing part."""
+    if not os.path.isdir(target_dir):
+        return False
+    stem = _safe_filename(type_id)
+    json_path = os.path.join(target_dir, f"{stem}.json")
+    svg_path = os.path.join(target_dir, f"{stem}.svg")
+    removed = False
+
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                meta = json.load(jf)
+            svg_file = meta.get("svg_file")
+            if isinstance(svg_file, str) and svg_file:
+                cand_svg = os.path.join(target_dir, os.path.basename(svg_file))
+                if os.path.isfile(cand_svg):
+                    os.remove(cand_svg)
+                    removed = True
+        except (OSError, ValueError):
+            pass
+        try:
+            os.remove(json_path)
+            removed = True
+        except OSError:
+            pass
+
+    if os.path.isfile(svg_path):
+        try:
+            os.remove(svg_path)
+            removed = True
+        except OSError:
+            pass
+
+    return removed
+
+
 def load_downloaded_parts(source_dir: str = DOWNLOADED_PARTS_DIR) -> list[FritzingComponentDef]:
     """Loads all persisted downloaded Fritzing parts from app/components/downloaded."""
     if not os.path.isdir(source_dir):

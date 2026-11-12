@@ -205,6 +205,98 @@ def search_catalog_candidates(
     return [item[2] for item in scored[:limit]]
 
 
+def search_fritzing_forum_candidates(
+    query: str,
+    exclude_type_ids: set[str] | None = None,
+    cancel_event: threading.Event | None = None,
+    limit: int = 8,
+) -> list[FritzingCatalogEntry]:
+    """
+    Searches forum.fritzing.org (prioritizing parts-submit category 23 and parts-help)
+    for topics with .fzpz part attachments.
+    """
+    q = query.strip()
+    if len(q) < 2 or (cancel_event is not None and cancel_event.is_set()):
+        return []
+
+    excluded = exclude_type_ids or set()
+    search_url = f"https://forum.fritzing.org/search.json?q={urllib.parse.quote(q)}"
+    try:
+        raw = _http_get_bytes(search_url, timeout=6.0)
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError):
+        return []
+
+    topics = data.get("topics") or []
+    if not topics:
+        return []
+
+    # Prioritize Parts Submit (23) and Parts Help (9) categories
+    def _topic_rank(t: dict) -> tuple[int, int]:
+        cat_id = t.get("category_id")
+        if cat_id == 23:
+            return (0, int(t.get("id", 0)))
+        if cat_id == 9:
+            return (1, int(t.get("id", 0)))
+        return (2, int(t.get("id", 0)))
+
+    topics = sorted(topics, key=_topic_rank)[:6]
+    entries: list[FritzingCatalogEntry] = []
+    seen_urls: set[str] = set()
+
+    def _fetch_topic_fzpz(topic: dict) -> list[FritzingCatalogEntry]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        tid = topic.get("id")
+        if not tid:
+            return []
+        t_title = (topic.get("title") or f"Forum Part {tid}").strip()
+        topic_url = f"https://forum.fritzing.org/t/{tid}.json"
+        try:
+            t_raw = _http_get_bytes(topic_url, timeout=6.0)
+            t_data = json.loads(t_raw.decode("utf-8", errors="replace"))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError):
+            return []
+
+        found: list[FritzingCatalogEntry] = []
+        posts = (t_data.get("post_stream") or {}).get("posts") or []
+        for post in posts:
+            cooked = post.get("cooked") or ""
+            for href in re.findall(r'href=["\']([^"\']*\.fzpz[^"\']*)["\']', cooked, re.I):
+                full_url = urllib.parse.urljoin("https://forum.fritzing.org", href)
+                digest = hashlib.sha1(full_url.encode("utf-8")).hexdigest()[:10]
+                type_id = f"fritzing_forum_{digest}"
+                if type_id in excluded:
+                    continue
+                fname = os.path.basename(urllib.parse.urlparse(full_url).path)
+                disp = _clean_display_name(fname) if fname and not fname.startswith("eqt") else t_title
+                if not disp or len(disp) < 3:
+                    disp = t_title
+                found.append(
+                    FritzingCatalogEntry(
+                        source_name="Fritzing Forum",
+                        repo="forum.fritzing.org",
+                        branch="",
+                        kind="forum_fzpz",
+                        path=full_url,
+                        display_name=t_title if t_title else disp,
+                        type_id=type_id,
+                    )
+                )
+        return found
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for res in pool.map(_fetch_topic_fzpz, topics):
+            for entry in res:
+                if entry.path in seen_urls:
+                    continue
+                seen_urls.add(entry.path)
+                entries.append(entry)
+                if len(entries) >= limit:
+                    return entries
+    return entries
+
+
 # --- SVG PHYSICAL UNITS & 2D TRANSFORM ENGINE ---
 
 def _parse_length_mm(raw: str | None) -> float | None:
@@ -545,6 +637,10 @@ def _read_fzpz_bytes(data: bytes) -> tuple[bytes, bytes]:
 
 def _download_candidate_files(entry: FritzingCatalogEntry) -> tuple[bytes, bytes]:
     """Downloads (.fzp bytes, breadboard .svg bytes) for a FritzingCatalogEntry."""
+    if entry.kind == "forum_fzpz":
+        data = _http_get_bytes(entry.path, timeout=10.0)
+        return _read_fzpz_bytes(data)
+
     encoded_path = urllib.parse.quote(entry.path, safe="/")
     raw_url = f"https://raw.githubusercontent.com/{entry.repo}/{entry.branch}/{encoded_path}"
     data = _http_get_bytes(raw_url, timeout=10.0)
@@ -623,57 +719,120 @@ def parse_and_validate_fritzing_part(
 
         vb_connectors.append((cid, cname, _classify_pin_type(cname, ctype), cdesc, center_vb[0], center_vb[1]))
 
-    if not vb_connectors or len(vb_connectors) > 120:
-        return None, f"Unsupported pin count ({len(vb_connectors)})"
+def _evaluate_alignment(
+    raw_conns: list[tuple[str, str, str, str, float, float]],
+    bus_adj: dict[str, set[str]],
+) -> tuple[tuple[int, int], dict[int, tuple[int, int]], list[int]]:
+    """Finds the anchor connector that maximizes 2.54 mm grid-aligned pins."""
+    best: tuple[tuple[int, int], dict[int, tuple[int, int]], list[int]] | None = None
+    for anchor in raw_conns:
+        ax, ay = anchor[4], anchor[5]
+        aligned: dict[int, tuple[int, int]] = {}
+        for j, item in enumerate(raw_conns):
+            gx_f = (item[4] - ax) / _MM_PER_HOLE
+            gy_f = (item[5] - ay) / _MM_PER_HOLE
+            gx = round(gx_f)
+            gy = round(gy_f)
+            err_mm = max(abs(gx_f - gx) * _MM_PER_HOLE, abs(gy_f - gy) * _MM_PER_HOLE)
+            if err_mm <= _GRID_TOLERANCE_MM:
+                aligned[j] = (gx, gy)
 
-    # Try standard authoring DPIs when root width/height lack physical units (px/unitless)
-    dpi_candidates = (96.0,) if explicit_units else (96.0, 72.0, 90.0)
-    best_result = None  # (score, aligned, raw_connectors, w_mm, h_mm)
-
-    for dpi in dpi_candidates:
-        scale_factor = 1.0 if explicit_units else (96.0 / dpi)
-        sx_mm = base_sx_mm * scale_factor
-        sy_mm = base_sy_mm * scale_factor
-        w_mm = base_w_mm * scale_factor
-        h_mm = base_h_mm * scale_factor
-        if not (0.5 <= w_mm <= 300.0 and 0.5 <= h_mm <= 300.0):
-            continue
-
-        raw_conns = [
-            (cid, cname, ptype, cdesc, (cx - vb_x) * sx_mm, (cy - vb_y) * sy_mm)
-            for (cid, cname, ptype, cdesc, cx, cy) in vb_connectors
+        aligned_cids = {raw_conns[j][0] for j in aligned}
+        unbused = [
+            j for j, item in enumerate(raw_conns)
+            if j not in aligned and not (bus_adj.get(item[0], set()) & aligned_cids)
         ]
+        score = (-len(unbused), len(aligned))
+        if best is None or score > best[0]:
+            best = (score, aligned, unbused)
+    assert best is not None
+    return best
 
-        for anchor in raw_conns:
-            ax, ay = anchor[4], anchor[5]
-            aligned: dict[int, tuple[int, int]] = {}
-            for j, item in enumerate(raw_conns):
-                gx_f = (item[4] - ax) / _MM_PER_HOLE
-                gy_f = (item[5] - ay) / _MM_PER_HOLE
-                gx = round(gx_f)
-                gy = round(gy_f)
-                err_mm = max(abs(gx_f - gx) * _MM_PER_HOLE, abs(gy_f - gy) * _MM_PER_HOLE)
-                if err_mm <= _GRID_TOLERANCE_MM:
-                    aligned[j] = (gx, gy)
 
-            aligned_cids = {raw_conns[j][0] for j in aligned}
-            unbused_indices: list[int] = []
-            for j, item in enumerate(raw_conns):
-                if j not in aligned:
-                    cid = item[0]
-                    if not (bus_adj.get(cid, set()) & aligned_cids):
-                        unbused_indices.append(j)
+def _has_hole_collision(
+    raw_conns: list[tuple[str, str, str, str, float, float]],
+    aligned: dict[int, tuple[int, int]],
+    bus_adj: dict[str, set[str]],
+) -> bool:
+    if not aligned:
+        return False
+    kept = sorted(aligned.keys())
+    base_gx, base_gy = aligned[kept[0]]
+    occupied: dict[tuple[int, int], str] = {}
+    for j in kept:
+        cid = raw_conns[j][0]
+        hole = (aligned[j][0] - base_gx, aligned[j][1] - base_gy)
+        if hole in occupied:
+            if occupied[hole] in bus_adj.get(cid, set()):
+                continue
+            return True
+        occupied[hole] = cid
+    return False
 
-            score = (-len(unbused_indices), len(aligned), 1 if dpi == 96.0 else 0)
-            if best_result is None or score > best_result[0]:
-                best_result = (score, aligned, raw_conns, w_mm, h_mm, unbused_indices)
 
-    if best_result is None:
-        return None, "Part physical dimensions outside perfboard bounds"
+def _find_best_scaled_alignment(
+    raw_conns: list[tuple[str, str, str, str, float, float]],
+    w_mm: float,
+    h_mm: float,
+    bus_adj: dict[str, set[str]],
+    orig_aligned_count: int,
+    orig_unbused_count: int,
+) -> tuple[float, list[tuple[str, str, str, str, float, float]], float, float, dict[int, tuple[int, int]]] | None:
+    """Checks if a uniform scale factor aligns unaligned pins to the 2.54 mm grid."""
+    if len(raw_conns) < 2:
+        return None
 
-    best_score, best_aligned, raw_connectors, svg_w_mm, svg_h_mm, best_unbused = best_result
-    total_conns = len(vb_connectors)
+    candidate_scales: set[float] = {10.0, 2.54, 96.0 / 25.4, 72.0 / 25.4, 90.0 / 25.4, 96.0 / 72.0, 2.0, 0.5, 0.1}
+    deltas: list[float] = []
+    for i in range(len(raw_conns)):
+        x1, y1 = raw_conns[i][4], raw_conns[i][5]
+        for j in range(i + 1, len(raw_conns)):
+            dx = abs(raw_conns[j][4] - x1)
+            dy = abs(raw_conns[j][5] - y1)
+            if dx > 0.02:
+                deltas.append(dx)
+            if dy > 0.02:
+                deltas.append(dy)
+    for d in sorted(set(round(v, 4) for v in deltas))[:10]:
+        candidate_scales.add(_MM_PER_HOLE / d)
+        candidate_scales.add((2.0 * _MM_PER_HOLE) / d)
 
+    best: tuple[tuple[int, int, float], float, list[tuple[str, str, str, str, float, float]], float, float, dict[int, tuple[int, int]]] | None = None
+    for s in candidate_scales:
+        if not (0.15 <= s <= 60.0) or abs(s - 1.0) < 0.04:
+            continue
+        sw, sh = w_mm * s, h_mm * s
+        if not (5.0 <= max(sw, sh) <= 350.0):
+            continue
+        scaled_conns = [(*item[:4], item[4] * s, item[5] * s) for item in raw_conns]
+        score, aligned, unbused = _evaluate_alignment(scaled_conns, bus_adj)
+        if len(aligned) < 2:
+            continue
+        if len(aligned) <= orig_aligned_count and len(unbused) >= orig_unbused_count:
+            continue
+        if _has_hole_collision(scaled_conns, aligned, bus_adj):
+            continue
+        rank = (-len(unbused), len(aligned), -abs(math.log(s)))
+        if best is None or rank > best[0]:
+            best = (rank, s, scaled_conns, sw, sh, aligned)
+
+    if best is None:
+        return None
+    return best[1], best[2], best[3], best[4], best[5]
+
+
+def _build_fritzing_component_def(
+    entry: FritzingCatalogEntry,
+    fzp_root: ET.Element,
+    svg_bytes: bytes,
+    raw_connectors: list[tuple[str, str, str, str, float, float]],
+    svg_w_mm: float,
+    svg_h_mm: float,
+    best_aligned: dict[int, tuple[int, int]],
+    bus_adj: dict[str, set[str]],
+    scale_factor: float | None = None,
+) -> FritzingComponentDef:
+    total_conns = len(raw_connectors)
     use_aligned = total_conns == 1 or len(best_aligned) >= 2
     final_items: list[tuple[tuple[str, str, str, str, float, float], int, int]] = []
     if use_aligned and best_aligned:
@@ -693,7 +852,6 @@ def parse_and_validate_fritzing_part(
                 other_cid = occupied_holes[hole]
                 if other_cid in bus_adj.get(cid, set()):
                     continue
-                # Fine-pitch collision: fall back to completely unaligned jumper-only part
                 use_aligned = False
                 final_items.clear()
                 break
@@ -740,6 +898,8 @@ def parse_and_validate_fritzing_part(
     off_grid_pins.sort(key=lambda op: (op.offset_y, op.offset_x, op.name))
 
     title = (fzp_root.findtext("title") or entry.display_name).strip()
+    if scale_factor is not None:
+        title = f"{title} ({scale_factor:.2f}x)"
     label = (fzp_root.findtext("label") or "U").strip() or "U"
     author = (fzp_root.findtext("author") or entry.source_name).strip()
     url = (fzp_root.findtext("url") or (f"https://github.com/{entry.repo}" if entry.repo else "")).strip()
@@ -752,6 +912,8 @@ def parse_and_validate_fritzing_part(
             tags.append(extra)
 
     attr_line = f"Source: {entry.source_name} ({author})"
+    if scale_factor is not None:
+        attr_line += f"\nScaled {scale_factor:.2f}x for 2.54 mm perfboard alignment."
     if not pins and off_grid_pins:
         attr_line += (
             f"\nUnaligned part ({len(off_grid_pins)} pins): pins cannot be aligned with the "
@@ -761,8 +923,9 @@ def parse_and_validate_fritzing_part(
         attr_line += f"\nJumper-only off-grid pins ({len(off_grid_pins)}): cannot plug into holes; connect via jumper wires."
     full_desc = f"{clean_desc}\n\n{attr_line}".strip() if clean_desc else attr_line
 
-    comp_def = FritzingComponentDef(
-        type_id=entry.type_id,
+    type_id = f"{entry.type_id}_s{int(round(scale_factor * 100))}" if scale_factor is not None else entry.type_id
+    return FritzingComponentDef(
+        type_id=type_id,
         name=title,
         category=f"Online ({entry.source_name})",
         default_label=label[:6],
@@ -786,7 +949,131 @@ def parse_and_validate_fritzing_part(
         is_remote_preview=True,
         off_grid_pins=off_grid_pins,
     )
-    return comp_def, None
+
+
+def parse_fritzing_part_options(
+    entry: FritzingCatalogEntry,
+    fzp_bytes: bytes,
+    svg_bytes: bytes,
+) -> tuple[FritzingComponentDef | None, FritzingComponentDef | None, float | None, str | None]:
+    """
+    Parses a Fritzing part with relaxed compatibility checks and also checks whether
+    a uniform scale factor aligns unaligned pins to the 2.54 mm grid.
+    Returns (orig_comp_def, scaled_comp_def, scale_factor, reason).
+    """
+    try:
+        fzp_root = ET.fromstring(fzp_bytes)
+        svg_root = ET.fromstring(svg_bytes)
+    except ET.ParseError as exc:
+        return None, None, None, f"Invalid XML/SVG: {exc}"
+
+    if svg_root.tag.split("}")[-1].lower() != "svg":
+        return None, None, None, "Not a valid SVG document"
+
+    frame = _parse_svg_physical_frame(svg_root)
+    if frame is None:
+        return None, None, None, "SVG lacks physical dimensions"
+    vb_x, vb_y, base_sx_mm, base_sy_mm, base_w_mm, base_h_mm, explicit_units = frame
+
+    id_map = _index_svg_elements(svg_root)
+
+    bus_adj: dict[str, set[str]] = {}
+    for bus in fzp_root.findall("./buses/bus"):
+        members = [m.get("connectorId") for m in bus.findall("nodeMember") if m.get("connectorId")]
+        mset = set(members)
+        for cid in members:
+            bus_adj.setdefault(cid, set()).update(mset)
+
+    vb_connectors: list[tuple[str, str, str, str, float, float]] = []
+    for conn in fzp_root.findall("./connectors/connector"):
+        cid = conn.get("id") or ""
+        cname = (conn.get("name") or cid or "Pin").strip()
+        ctype = (conn.get("type") or "male").strip().lower()
+        cdesc = (conn.findtext("description") or "").strip()
+        bb_p = conn.find("./views/breadboardView/p")
+        if bb_p is None:
+            continue
+
+        sid = bb_p.get("svgId")
+        tid = bb_p.get("terminalId")
+
+        center_vb = None
+        if tid and tid in id_map:
+            el_t, mat_t = id_map[tid]
+            center_vb = _resolve_element_center(el_t, mat_t)
+        if center_vb is None and sid and sid in id_map:
+            el_s, mat_s = id_map[sid]
+            center_vb = _resolve_element_center(el_s, mat_s)
+        if center_vb is None:
+            continue
+
+        vb_connectors.append((cid, cname, _classify_pin_type(cname, ctype), cdesc, center_vb[0], center_vb[1]))
+
+    if not vb_connectors or len(vb_connectors) > 256:
+        return None, None, None, f"Unsupported pin count ({len(vb_connectors)})"
+
+    dpi_candidates = (96.0,) if explicit_units else (96.0, 72.0, 90.0)
+    best_result = None
+
+    for dpi in dpi_candidates:
+        scale_factor = 1.0 if explicit_units else (96.0 / dpi)
+        sx_mm = base_sx_mm * scale_factor
+        sy_mm = base_sy_mm * scale_factor
+        w_mm = base_w_mm * scale_factor
+        h_mm = base_h_mm * scale_factor
+        if not (0.05 <= w_mm <= 1000.0 and 0.05 <= h_mm <= 1000.0):
+            continue
+
+        raw_conns = [
+            (cid, cname, ptype, cdesc, (cx - vb_x) * sx_mm, (cy - vb_y) * sy_mm)
+            for (cid, cname, ptype, cdesc, cx, cy) in vb_connectors
+        ]
+        score, aligned, unbused = _evaluate_alignment(raw_conns, bus_adj)
+        full_score = (score[0], score[1], 1 if dpi == 96.0 else 0)
+        if best_result is None or full_score > best_result[0]:
+            best_result = (full_score, aligned, raw_conns, w_mm, h_mm, unbused)
+
+    if best_result is None:
+        raw_conns = [
+            (cid, cname, ptype, cdesc, (cx - vb_x) * base_sx_mm, (cy - vb_y) * base_sy_mm)
+            for (cid, cname, ptype, cdesc, cx, cy) in vb_connectors
+        ]
+        score, aligned, unbused = _evaluate_alignment(raw_conns, bus_adj)
+        best_result = ((score[0], score[1], 1), aligned, raw_conns, base_w_mm, base_h_mm, unbused)
+
+    _, best_aligned, raw_connectors, svg_w_mm, svg_h_mm, best_unbused = best_result
+    orig_comp = _build_fritzing_component_def(
+        entry, fzp_root, svg_bytes, raw_connectors, svg_w_mm, svg_h_mm, best_aligned, bus_adj
+    )
+
+    scaled_comp: FritzingComponentDef | None = None
+    best_scale: float | None = None
+    if len(orig_comp.off_grid_pins) > 0:
+        orig_aligned_cnt = len(orig_comp.pins)
+        orig_unbused_cnt = len(best_unbused)
+        scaled_match = _find_best_scaled_alignment(
+            raw_connectors, svg_w_mm, svg_h_mm, bus_adj, orig_aligned_cnt, orig_unbused_cnt
+        )
+        if scaled_match is not None:
+            best_scale, s_conns, s_w, s_h, s_aligned = scaled_match
+            scaled_comp = _build_fritzing_component_def(
+                entry, fzp_root, svg_bytes, s_conns, s_w, s_h, s_aligned, bus_adj, scale_factor=best_scale
+            )
+
+    return orig_comp, scaled_comp, best_scale, None
+
+
+def parse_and_validate_fritzing_part(
+    entry: FritzingCatalogEntry,
+    fzp_bytes: bytes,
+    svg_bytes: bytes,
+) -> tuple[FritzingComponentDef | None, str | None]:
+    """
+    Validates PerfBoard compatibility for a Fritzing part (including unaligned jumper-only parts).
+    Returns (FritzingComponentDef, None) if valid, else (None, reason).
+    """
+    orig_comp, _scaled, _scale, reason = parse_fritzing_part_options(entry, fzp_bytes, svg_bytes)
+    return orig_comp, reason
 
 
 def _read_local_fzp_with_svg(fzp_path: str) -> tuple[bytes, bytes]:
@@ -826,24 +1113,27 @@ def _read_local_fzp_with_svg(fzp_path: str) -> tuple[bytes, bytes]:
     raise ValueError(f"Breadboard SVG '{raw_img}' not found next to the .fzp file")
 
 
-def import_fritzing_file(path: str) -> tuple[FritzingComponentDef | None, str | None]:
+def import_fritzing_file_with_options(
+    path: str,
+) -> tuple[FritzingComponentDef | None, FritzingComponentDef | None, float | None, str | None]:
     """
-    Imports a local .fzpz archive, or a .fzp with its breadboard SVG alongside it.
-    Returns (component, None) if 2.54 mm compatible, else (None, reason).
+    Imports a local .fzpz archive or .fzp + breadboard SVG, returning:
+    (orig_comp, scaled_comp, scale_factor, error_reason).
+    If a uniform scale factor aligns unaligned pins to 2.54 mm, scaled_comp is populated.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext not in (".fzpz", ".fzp"):
-        return None, "Unsupported file type (expected .fzpz or .fzp)"
+        return None, None, None, "Unsupported file type (expected .fzpz or .fzp)"
     try:
         if os.path.getsize(path) > _MAX_LOCAL_FILE_BYTES:
-            return None, "File is too large"
+            return None, None, None, "File is too large"
         if ext == ".fzpz":
             with open(path, "rb") as f:
                 fzp_bytes, svg_bytes = _read_fzpz_bytes(f.read())
         else:
             fzp_bytes, svg_bytes = _read_local_fzp_with_svg(path)
     except (OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
-        return None, str(exc)
+        return None, None, None, str(exc)
 
     stem = re.sub(r"[^a-zA-Z0-9]+", "_", os.path.splitext(os.path.basename(path))[0]).strip("_").lower()[:36] or "part"
     digest = hashlib.sha1(fzp_bytes + svg_bytes).hexdigest()[:8]
@@ -856,7 +1146,16 @@ def import_fritzing_file(path: str) -> tuple[FritzingComponentDef | None, str | 
         display_name=_clean_display_name(path),
         type_id=f"fritzing_{stem}_{digest}",
     )
-    return parse_and_validate_fritzing_part(entry, fzp_bytes, svg_bytes)
+    return parse_fritzing_part_options(entry, fzp_bytes, svg_bytes)
+
+
+def import_fritzing_file(path: str) -> tuple[FritzingComponentDef | None, str | None]:
+    """
+    Imports a local .fzpz archive, or a .fzp with its breadboard SVG alongside it.
+    Returns (component, None) if valid, else (None, reason).
+    """
+    orig_comp, _scaled, _scale, reason = import_fritzing_file_with_options(path)
+    return orig_comp, reason
 
 
 def search_compatible_fritzing_parts(
@@ -864,7 +1163,7 @@ def search_compatible_fritzing_parts(
     exclude_type_ids: set[str] | None = None,
     cancel_event: threading.Event | None = None,
     on_compatible_cb: Callable[[FritzingComponentDef], None] | None = None,
-    limit_candidates: int = 14,
+    limit_candidates: int = 24,
 ) -> list[FritzingComponentDef]:
     """
     Searches public Fritzing catalogs, validates candidate compatibility concurrently,
@@ -875,6 +1174,17 @@ def search_compatible_fritzing_parts(
         exclude_type_ids=exclude_type_ids,
         limit=limit_candidates,
     )
+    forum_candidates = search_fritzing_forum_candidates(
+        query,
+        exclude_type_ids=exclude_type_ids,
+        cancel_event=cancel_event,
+        limit=8,
+    )
+    seen_ids = {c.type_id for c in candidates}
+    for fc in forum_candidates:
+        if fc.type_id not in seen_ids:
+            candidates.append(fc)
+            seen_ids.add(fc.type_id)
     if not candidates or (cancel_event is not None and cancel_event.is_set()):
         return []
 

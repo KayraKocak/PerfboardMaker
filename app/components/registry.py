@@ -5,6 +5,7 @@ from typing import Callable, Optional
 from app.models.component_def import ComponentDef
 from app.components.fritzing_part import (
     FritzingComponentDef,
+    delete_downloaded_part,
     load_downloaded_parts,
     save_downloaded_part,
 )
@@ -150,6 +151,19 @@ class ComponentRegistry:
                 cb(type_id)
             except Exception:
                 pass
+        return True
+
+    def uninstall_downloaded(self, type_id: str) -> bool:
+        """Removes a downloaded/imported Fritzing component from registry and disk."""
+        comp = self._components.get(type_id)
+        if not isinstance(comp, FritzingComponentDef):
+            return False
+        delete_downloaded_part(type_id)
+        self._components.pop(type_id, None)
+        self._previews.pop(type_id, None)
+        if comp.category and not any(c.category == comp.category for c in self._components.values()):
+            if comp.category in self._categories:
+                self._categories.remove(comp.category)
         return True
 
     def get(self, type_id: str) -> Optional[ComponentDef]:
