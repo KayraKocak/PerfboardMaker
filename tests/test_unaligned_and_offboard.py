@@ -195,6 +195,73 @@ class UnalignedAndOffboardTests(unittest.TestCase):
         finally:
             cv.deleteLater()
 
+    def test_optimize_board_routes_via_first_board_hole_and_preserves_direct_jumpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jst_4pin.fzpz")
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("part.jst.fzp", _make_jst_fzp())
+                zf.writestr("svg.breadboard.jst.svg", _make_jst_svg())
+            comp, err = import_fritzing_file(path)
+            self.assertIsNone(err)
+
+        REGISTRY.register(comp)
+        cv = CanvasView(BoardConfig(cols=16, rows=12))
+        try:
+            # Place unaligned component off-board and an aligned DIP/nano on-board
+            jst = cv.add_component(comp.type_id, -4, 3)
+            nano = cv.add_component("arduino_nano", 6, 4)
+            nano_pins = nano.get_pin_positions(REGISTRY.get("arduino_nano"))
+            _, n_col, n_row, _ = nano_pins[0]
+
+            off_pins = jst.get_off_grid_pin_positions(comp)
+            # Pin 0 -> perfboard hole (2, 3) via jumper, then messy solder path to nano pin
+            j_board_uid = cv.add_jumper(
+                off_pins[0][1], off_pins[0][2], 2, 3,
+                start_pin=(jst.uid, 0, off_pins[0][0]),
+            ).jumper.uid
+            # Redundant second jumper from Pin 0 to (2, 5) that should NOT be used as the anchor
+            cv.add_jumper(
+                off_pins[0][1], off_pins[0][2], 2, 5,
+                start_pin=(jst.uid, 0, off_pins[0][0]),
+            )
+            cv.solder_mgr.connect_holes((2, 3), (n_col, n_row))
+
+            # Pin 1 -> Pin 2 directly via jumper (neither end on perfboard)
+            j_direct_uid = cv.add_jumper(
+                off_pins[1][1], off_pins[1][2], off_pins[2][1], off_pins[2][2],
+                start_pin=(jst.uid, 1, off_pins[1][0]),
+                end_pin=(jst.uid, 2, off_pins[2][0]),
+            ).jumper.uid
+
+            groups = cv.get_optimize_board_groups()
+            self.assertEqual(len(groups), 1)
+            group_holes = groups[0].all_holes()
+            self.assertIn((2, 3), group_holes)
+            self.assertIn((n_col, n_row), group_holes)
+            self.assertNotIn((2, 5), group_holes)
+
+            res = cv.optimize_board(precomputed_groups=groups)
+            self.assertTrue(res["success"], res.get("message"))
+
+            remaining_uids = {j.uid for j in cv.jumpers}
+            self.assertIn(j_board_uid, remaining_uids)
+            self.assertIn(j_direct_uid, remaining_uids)
+
+            # Verify (2, 3) and (n_col, n_row) are still electrically connected after optimize
+            px, py = cv.config.grid_to_board_pos(2, 3)
+            traces, jumpers = cv.get_conductive_net_at(2, 3, QPointF(px, py))
+            net_holes = set()
+            for t in traces:
+                net_holes.update(t.holes)
+            for j in jumpers:
+                for h in (j.start_hole(), j.end_hole()):
+                    if h is not None:
+                        net_holes.add(h)
+            self.assertIn((n_col, n_row), net_holes)
+        finally:
+            REGISTRY._components.pop(comp.type_id, None)
+            cv.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

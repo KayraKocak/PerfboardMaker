@@ -33,7 +33,7 @@ from app.models.project import (
 from app.models.router import (
     AutoConnectSettings, AutoConnectTarget, AutoConnectGroup,
     get_group_color, connect_targets, connect_multiple_groups,
-    extract_connected_pin_groups
+    extract_connected_pin_groups, partition_offgrid_jumpers
 )
 from app.views.autoconnect_overlay import AutoConnectOverlayItem
 
@@ -1867,14 +1867,20 @@ class CanvasView(QGraphicsView):
         original_state = self.serialize_state()
         preserved_view_side = self.config.view_side
 
-        # Clear all existing solder paths and jumpers while preserving placed components
+        # Clear existing solder paths and on-board jumpers while preserving off-grid/off-board jumpers
         self._clear_net_highlight()
+        preserved_jumpers, _ = partition_offgrid_jumpers(self.config, self.jumpers)
+        preserved_ids = {id(j) for j in preserved_jumpers}
+        kept_items = []
         for j_it in list(self.jumper_items):
-            j_it.setSelected(False)
-            if j_it.scene() == self.scene:
-                self.scene.removeItem(j_it)
-        self.jumper_items.clear()
-        self.jumpers.clear()
+            if id(j_it.jumper) in preserved_ids:
+                kept_items.append(j_it)
+            else:
+                j_it.setSelected(False)
+                if j_it.scene() == self.scene:
+                    self.scene.removeItem(j_it)
+        self.jumper_items = kept_items
+        self.jumpers = list(preserved_jumpers)
         self.solder_mgr.clear()
         self.solder_item.update()
 

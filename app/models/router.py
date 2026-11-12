@@ -1310,6 +1310,7 @@ def connect_multiple_groups(
     all_groups_target_holes: set[tuple[int, int]] = set()
     for g in groups:
         all_groups_target_holes.update(g.all_holes())
+    all_pin_holes.update(all_groups_target_holes)
 
     base_obstacles = get_all_obstacle_holes(
         config, solder_mgr, jumpers, components, registry, all_groups_target_holes
@@ -1437,6 +1438,50 @@ def connect_multiple_groups(
     }
 
 
+def partition_offgrid_jumpers(
+    config: BoardConfig,
+    jumpers: list[JumperWire],
+) -> tuple[list[JumperWire], list[tuple[tuple, tuple[int, int], str]]]:
+    """
+    Separates jumpers attached to off-grid or off-board pins:
+    - Direct pin-to-pin jumpers (neither end on a valid perfboard hole) are preserved as-is.
+    - For an off-grid/off-board pin connected to the perfboard, its first perfboard
+      hole jumper is preserved and that board hole is returned as a routing pin anchor.
+    Returns (preserved_jumpers, [(pin_node, board_hole, fallback_pin_name), ...]).
+    """
+    preserved: list[JumperWire] = []
+    seen_pin_to_board: dict[tuple, tuple[int, int]] = {}
+    board_anchors: list[tuple[tuple, tuple[int, int], str]] = []
+
+    def _classify_end(pin_ref, hole: tuple[int, int] | None) -> tuple[bool, tuple, str]:
+        if pin_ref is not None:
+            return (True, ("pin", pin_ref[0], pin_ref[1]), pin_ref[2])
+        if hole is not None and not config.is_valid_hole(*hole):
+            return (True, ("hole", hole[0], hole[1]), f"Pin({hole[0]},{hole[1]})")
+        return (False, ("board", hole[0], hole[1]) if hole is not None else ("board", 0, 0), "")
+
+    for j in jumpers:
+        s_off, s_node, s_name = _classify_end(j.start_pin, j.start_hole())
+        e_off, e_node, e_name = _classify_end(j.end_pin, j.end_hole())
+        if s_off and e_off:
+            # Direct off-grid/off-board pin-to-pin jumper: leave as-is
+            preserved.append(j)
+        elif s_off and not e_off:
+            board_hole = j.end_hole()
+            if board_hole is not None and s_node not in seen_pin_to_board:
+                seen_pin_to_board[s_node] = board_hole
+                preserved.append(j)
+                board_anchors.append((s_node, board_hole, s_name))
+        elif e_off and not s_off:
+            board_hole = j.start_hole()
+            if board_hole is not None and e_node not in seen_pin_to_board:
+                seen_pin_to_board[e_node] = board_hole
+                preserved.append(j)
+                board_anchors.append((e_node, board_hole, e_name))
+
+    return preserved, board_anchors
+
+
 def extract_connected_pin_groups(
     config: BoardConfig,
     solder_mgr: SolderManager,
@@ -1449,8 +1494,8 @@ def extract_connected_pin_groups(
     grouping component pins that are shorted together into AutoConnectGroup objects.
     Only nets spanning 2 or more distinct component pin holes are included.
     """
-    # 1. Build conductive adjacency graph across holes
-    adj: dict[tuple[int, int], set[tuple[int, int]]] = defaultdict(set)
+    # 1. Build conductive adjacency graph across holes & off-grid pin nodes
+    adj: dict[tuple, set[tuple]] = defaultdict(set)
 
     for trace in solder_mgr.traces:
         if trace.segments:
@@ -1475,15 +1520,32 @@ def extract_connected_pin_groups(
         adj[s].add(e)
         adj[e].add(s)
 
-    # 2. Index component pins by board hole
-    pins_by_hole: dict[tuple[int, int], list[tuple[PlacedComponent, str]]] = defaultdict(list)
+    # 2. Index component pins by board hole (including first perfboard landing hole for off-grid pins)
+    pins_by_hole: dict[tuple[int, int], list[tuple[PlacedComponent | None, str]]] = defaultdict(list)
+    comp_by_uid: dict[str, PlacedComponent] = {}
+    offboard_pin_lookup: dict[tuple[int, int], tuple[PlacedComponent, str]] = {}
     for comp in components:
+        comp_by_uid[comp.uid] = comp
         comp_def = registry.get(comp.type_id)
         if not comp_def:
             continue
         for pname, pc, pr, _ in comp.get_pin_positions(comp_def):
             if config.is_valid_hole(pc, pr):
                 pins_by_hole[(pc, pr)].append((comp, pname))
+            else:
+                offboard_pin_lookup.setdefault((pc, pr), (comp, pname))
+
+    _, board_anchors = partition_offgrid_jumpers(config, jumpers)
+    for pin_node, board_hole, fallback_name in board_anchors:
+        if pin_node[0] == "pin":
+            comp = comp_by_uid.get(pin_node[1])
+            pname = fallback_name
+        else:
+            found = offboard_pin_lookup.get((pin_node[1], pin_node[2]))
+            comp = found[0] if found else None
+            pname = found[1] if found else fallback_name
+        if not any(c is comp and n == pname for c, n in pins_by_hole[board_hole]):
+            pins_by_hole[board_hole].append((comp, pname))
 
     # 3. Traverse connected components via BFS
     visited: set[tuple[int, int]] = set()
