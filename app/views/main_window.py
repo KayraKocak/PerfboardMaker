@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
             style=self.config.style,
             view_side="bottom",
             transparent=self.config.transparent,
+            transparent_components=self.config.transparent_components,
         )
 
         # Central Area with Viewport Toolbar and Canvas Host
@@ -209,7 +210,7 @@ class MainWindow(QMainWindow):
         self.viewport_splitter.addWidget(self.canvas_back)
         vp_host_layout.addWidget(self.viewport_splitter)
 
-        # Floating Top-Left Viewport Toggle Buttons ("Transparent" & "Double-View")
+        # Floating Top-Left Viewport Toggle Buttons
         self.viewport_overlay = QWidget(self.viewport_host)
         self.viewport_overlay.setObjectName("ViewportOverlay")
         overlay_layout = QHBoxLayout(self.viewport_overlay)
@@ -223,7 +224,7 @@ class MainWindow(QMainWindow):
             "}"
         )
 
-        self.btn_transparent = QPushButton("Transparent", self.viewport_overlay)
+        self.btn_transparent = QPushButton("Transparent PCB", self.viewport_overlay)
         self.btn_transparent.setCheckable(True)
         self.btn_transparent.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_transparent.setToolTip("Make perfboard semi-transparent to see back-side solder traces, jumpers, and highlights")
@@ -236,6 +237,12 @@ class MainWindow(QMainWindow):
             "QPushButton:checked { background-color: #0ea5e9; color: #ffffff; border: 1px solid #38bdf8; }"
             "QPushButton:checked:hover { background-color: #0284c7; }"
         )
+
+        self.btn_transparent_components = QPushButton("Transparent Components", self.viewport_overlay)
+        self.btn_transparent_components.setCheckable(True)
+        self.btn_transparent_components.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_transparent_components.setToolTip("Make placed components semi-transparent independently of the PCB, solder traces, and jumpers")
+        self.btn_transparent_components.setStyleSheet(self.btn_transparent.styleSheet())
 
         self.btn_double_view = QPushButton("Double-View", self.viewport_overlay)
         self.btn_double_view.setCheckable(True)
@@ -252,6 +259,7 @@ class MainWindow(QMainWindow):
         )
 
         overlay_layout.addWidget(self.btn_transparent)
+        overlay_layout.addWidget(self.btn_transparent_components)
         overlay_layout.addWidget(self.btn_double_view)
         self.viewport_overlay.adjustSize()
         self.viewport_overlay.move(10, 10)
@@ -326,6 +334,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self):
         # Viewport Overlay Toggles
         self.btn_transparent.toggled.connect(self._on_transparent_toggled)
+        self.btn_transparent_components.toggled.connect(self._on_transparent_components_toggled)
         self.btn_double_view.toggled.connect(self._on_double_view_toggled)
 
         # Canvas & Back Partner Canvas to Status / Props
@@ -725,6 +734,10 @@ class MainWindow(QMainWindow):
 
     def _on_transparent_toggled(self, checked: bool):
         self.canvas.set_transparent(checked)
+        self.viewport_overlay.raise_()
+
+    def _on_transparent_components_toggled(self, checked: bool):
+        self.canvas.set_components_transparent(checked)
         self.viewport_overlay.raise_()
 
     def swap_double_view_sides(self):

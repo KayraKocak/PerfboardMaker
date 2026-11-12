@@ -227,6 +227,7 @@ class CanvasView(QGraphicsView):
         target.config.pad_radius_px = self.config.pad_radius_px
         target.config.style = self.config.style
         target.config.transparent = bool(getattr(self.config, "transparent", False))
+        target.config.transparent_components = bool(getattr(self.config, "transparent_components", False))
 
     def _notify_partner_sync(self, full: bool = True):
         partner = self._partner_view
@@ -244,6 +245,8 @@ class CanvasView(QGraphicsView):
                 partner.solder_item.update()
                 for item in partner.component_items:
                     item.update()
+                if partner.placement_ghost_item is not None:
+                    partner.placement_ghost_item.update()
                 for j_item in partner.jumper_items:
                     j_item.update()
         finally:
@@ -369,6 +372,15 @@ class CanvasView(QGraphicsView):
             item.update()
         for j_item in self.jumper_items:
             j_item.update()
+        self._notify_partner_sync(full=False)
+
+    def set_components_transparent(self, enabled: bool):
+        """Toggles semi-transparent component artwork independently of PCB and routing layers."""
+        self.config.transparent_components = bool(enabled)
+        for item in self.component_items:
+            item.update()
+        if self.placement_ghost_item is not None:
+            self.placement_ghost_item.update()
         self._notify_partner_sync(full=False)
 
     def set_double_view_active(self, active: bool, badge: str = ""):

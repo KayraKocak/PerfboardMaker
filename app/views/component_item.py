@@ -97,19 +97,25 @@ class ComponentItem(QGraphicsItem):
         p = self.config.pitch_px
         is_bottom = (self.config.view_side == "bottom")
         is_transparent = bool(getattr(self.config, "transparent", False))
+        comp_alpha = 0.5 if bool(getattr(self.config, "transparent_components", False)) else 1.0
 
         if is_bottom:
             painter.scale(-1.0, 1.0)
-            painter.rotate(self.instance.rotation)
+        painter.rotate(self.instance.rotation)
+
+        painter.save()
+        if comp_alpha < 1.0:
+            painter.setOpacity(painter.opacity() * comp_alpha)
+        if is_bottom:
             if is_transparent:
                 painter.save()
-                painter.setOpacity(0.38)
+                painter.setOpacity(painter.opacity() * 0.38)
                 self.comp_def.draw_top(painter, self.instance, p)
                 painter.restore()
             self.comp_def.draw_bottom(painter, self.instance, p)
         else:
-            painter.rotate(self.instance.rotation)
             self.comp_def.draw_top(painter, self.instance, p)
+        painter.restore()
 
         # Draw crisp selection contour matching exact component body
         if self.isSelected():

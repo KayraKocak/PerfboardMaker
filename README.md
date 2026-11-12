@@ -14,7 +14,7 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
 ### 1. Viewport Toolbar & Editing Modes
 - **Select Mode (`1`)**:
   - Select, move, and rotate (`R` / `Shift+R`) components or drag jumper endpoints and bend handles.
-  - **Solder Net Highlighting & Selectable Solder Paths**: Hovering over a solder pad, trace, or jumper on the Back View (or Front View with **Transparent** enabled) highlights the entire conductive net in gold. Clicking a solder path selects it and displays every connected component pin (both direct and bridged via jumpers) in a resizeable **Connected Pins** table in the Inspector.
+  - **Solder Net Highlighting & Selectable Solder Paths**: Hovering over a solder pad, trace, or jumper on the Back View (or Front View with **Transparent PCB** enabled) highlights the entire conductive net in gold. Clicking a solder path selects it and displays every connected component pin (both direct and bridged via jumpers) in a resizeable **Connected Pins** table in the Inspector.
 - **Solder Mode (`2`)**:
   - Draw realistic tinned solder bridges on the back side of the perfboard. Traces stay isolated unless connected through a shared hole.
   - **Erase (`LCtrl` + Click/Drag)**: Remove soldered holes or trace segments; disconnected branches automatically split into separate traces.
@@ -36,7 +36,8 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
 - **Top & Bottom 2D Orthogonal Views (`F`)**:
   - **Top (Component Side)** shows component bodies, silkscreen labels, and leads.
   - **Bottom (Solder Side)** mirrors the board horizontally ($x' = \text{width} - x$) like flipping a real PCB, showing metallic solder joints, pin labels, and translucent top-component outlines.
-- **Transparent Toggle**: Makes the perfboard substrate semi-transparent so back-side solder traces, opposite-side silhouettes, and conductive net highlights are visible and selectable directly from the Front View.
+- **Transparent PCB Toggle**: Makes the perfboard substrate semi-transparent so back-side solder traces, opposite-side silhouettes, and conductive net highlights are visible and selectable directly from the Front View.
+- **Transparent Components Toggle**: Makes component artwork semi-transparent independently of the PCB, solder traces, and jumper wires in both views.
 - **Double-View Toggle**: Splits the viewport side-by-side (**Front** & **Back**) with live synchronized edits, mirrored wheel zoom, a mirrored `"+"` partner cursor matching the exact corresponding board coordinate, and a right-click middle splitter menu (`← / →`) to swap Left and Right sides.
 - **Split Inspector Panel**: Always displays active tool/mode settings in the top pane while dynamically revealing selected Component, Jumper, or Solder Path properties in the bottom pane (automatically hidden when nothing is selected).
 
