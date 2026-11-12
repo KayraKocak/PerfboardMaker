@@ -24,6 +24,7 @@ class BoardConfig:
     style: str = "green"  # "green", "brown", "blue", "black"
     view_side: Literal["top", "bottom"] = "top"
     transparent: bool = False
+    transparent_components: bool = False
 
     @property
     def width_px(self) -> float:
