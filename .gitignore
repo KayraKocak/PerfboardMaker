@@ -9,8 +9,9 @@ venv/
 env/
 ENV/
 
-# Runtime generated files (autosaves & logs)
+# Runtime generated files (autosaves, tests & logs)
 autosaves/
+tests/
 logs/
 *.log
 
