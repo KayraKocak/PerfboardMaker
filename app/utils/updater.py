@@ -59,21 +59,22 @@ def normalize_version_str(raw: str | None) -> str | None:
     return m.group(1)
 
 
-def parse_version(version_str: str | None) -> tuple[int, Decimal, tuple[int, ...]]:
+def parse_version(version_str: str | None) -> Decimal:
     """
-    Parses a dotted numeric version string as (major, Decimal('0.<minor>'), extra_ints)
-    so decimal-style versions like '0.01' < '0.1' < '2.72' < '12.2' compare accurately.
+    Parses a version string as a single decimal float value:
+    the first segment before the first dot is the integer part, and all digits
+    after the first dot form the fractional part (ignoring any subsequent dots,
+    e.g. '12.7.1' == Decimal('12.71')).
     """
     norm = normalize_version_str(version_str)
     if not norm:
-        return (0, Decimal("0"), ())
+        return Decimal("0")
     parts = norm.split(".")
-    major = int(parts[0])
-    minor = Decimal(f"0.{parts[1]}") if len(parts) > 1 else Decimal("0")
-    extra = [int(p) for p in parts[2:]]
-    while extra and extra[-1] == 0:
-        extra.pop()
-    return (major, minor, tuple(extra))
+    major_str = parts[0]
+    frac_str = "".join(parts[1:])
+    if frac_str:
+        return Decimal(f"{major_str}.{frac_str}")
+    return Decimal(major_str)
 
 
 def is_newer_version(remote_ver: str | None, local_ver: str | None) -> bool:
