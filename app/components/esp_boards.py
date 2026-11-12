@@ -41,6 +41,7 @@ class DualRowDevBoardDef(ComponentDef):
         pad_side: float = 0.6,
         usb_type: str = "micro",
         rf_antenna: str = "pcb",
+        usb_on_top: bool = False,
         tags: list[str] | None = None,
     ):
         assert len(left_names) == len(right_names)
@@ -54,6 +55,7 @@ class DualRowDevBoardDef(ComponentDef):
         self.pad_side = pad_side
         self.usb_type = usb_type
         self.rf_antenna = rf_antenna
+        self.usb_on_top = usb_on_top
 
         pins: list[PinDef] = []
         for i, pname in enumerate(left_names):
@@ -85,8 +87,11 @@ class DualRowDevBoardDef(ComponentDef):
     def get_shape(self, instance, pitch_px: float) -> QPainterPath:
         p = pitch_px
         rect = self._pcb_rect(p)
-        # Include slight USB overhang at bottom
-        shape_rect = QRectF(rect.left(), rect.top(), rect.width(), rect.height() + 0.55 * p)
+        # Include slight USB overhang at top or bottom
+        if self.usb_on_top:
+            shape_rect = QRectF(rect.left(), rect.top() - 0.55 * p, rect.width(), rect.height() + 0.55 * p)
+        else:
+            shape_rect = QRectF(rect.left(), rect.top(), rect.width(), rect.height() + 0.55 * p)
         path = QPainterPath()
         path.addRoundedRect(shape_rect, 3.5, 3.5)
         return path
@@ -111,43 +116,58 @@ class DualRowDevBoardDef(ComponentDef):
         painter.setPen(QPen(c_edge, 1.0))
         painter.drawRoundedRect(rect, 3.5, 3.5)
 
-        # Top antenna + RF module area
+        # Antenna + RF module area (top by default, or bottom when usb_on_top=True)
         ant_h = max(1.1 * p, (self.pad_top - 0.5) * p)
         if self.rf_antenna == "ceramic":
             # Small ceramic chip antenna + gold feed pad
             cw, ch = 1.6 * p, 0.7 * p
+            cy_ant = (by + bh - 0.35 * p - ch) if self.usb_on_top else (by + 0.35 * p)
             painter.setBrush(QColor(235, 225, 200))
             painter.setPen(QPen(QColor(180, 165, 130), 0.8))
-            painter.drawRoundedRect(QRectF(cx - cw / 2.0, by + 0.35 * p, cw, ch), 1.0, 1.0)
-            shield_y = by + 1.35 * p
+            painter.drawRoundedRect(QRectF(cx - cw / 2.0, cy_ant, cw, ch), 1.0, 1.0)
             shield_w = min(bw * 0.64, 4.4 * p)
             shield_h = min(bh * 0.34, 3.4 * p)
+            shield_y = (by + bh - 1.35 * p - shield_h) if self.usb_on_top else (by + 1.35 * p)
         else:
-            # Meander PCB antenna trace at top edge
+            # Meander PCB antenna trace at edge
             ant_w = min(bw * 0.52, 4.4 * p)
             ax0 = cx - ant_w / 2.0
-            ay0 = by + 0.35 * p
             ah = min(ant_h * 0.75, 1.5 * p)
+            ay0 = (by + bh - 0.35 * p - ah) if self.usb_on_top else (by + 0.35 * p)
             painter.setPen(QPen(QColor(215, 175, 65), max(1.4, p * 0.08)))
             ap = QPainterPath()
-            ap.moveTo(ax0, ay0 + ah)
-            steps = 5
-            sw = ant_w / steps
-            for s in range(steps):
-                x1 = ax0 + s * sw
-                x2 = x1 + sw
-                if s % 2 == 0:
-                    ap.lineTo(x1, ay0)
-                    ap.lineTo(x2, ay0)
-                else:
-                    ap.lineTo(x1, ay0 + ah)
-                    ap.lineTo(x2, ay0 + ah)
+            if self.usb_on_top:
+                ap.moveTo(ax0, ay0)
+                steps = 5
+                sw = ant_w / steps
+                for s in range(steps):
+                    x1 = ax0 + s * sw
+                    x2 = x1 + sw
+                    if s % 2 == 0:
+                        ap.lineTo(x1, ay0 + ah)
+                        ap.lineTo(x2, ay0 + ah)
+                    else:
+                        ap.lineTo(x1, ay0)
+                        ap.lineTo(x2, ay0)
+            else:
+                ap.moveTo(ax0, ay0 + ah)
+                steps = 5
+                sw = ant_w / steps
+                for s in range(steps):
+                    x1 = ax0 + s * sw
+                    x2 = x1 + sw
+                    if s % 2 == 0:
+                        ap.lineTo(x1, ay0)
+                        ap.lineTo(x2, ay0)
+                    else:
+                        ap.lineTo(x1, ay0 + ah)
+                        ap.lineTo(x2, ay0 + ah)
             painter.drawPath(ap)
 
-            # Metallic ESP RF shield can below antenna
-            shield_y = by + ah + 0.55 * p
+            # Metallic ESP RF shield can
             shield_w = min(bw * 0.62, 6.2 * p)
             shield_h = min(bh * 0.36, 6.0 * p)
+            shield_y = (by + bh - ah - 0.55 * p - shield_h) if self.usb_on_top else (by + ah + 0.55 * p)
 
         # Draw RF metallic shield
         sx = cx - shield_w / 2.0
@@ -166,11 +186,11 @@ class DualRowDevBoardDef(ComponentDef):
         painter.drawText(QRectF(sx + 2, shield_y + 2, shield_w - 4, shield_h - 4),
                          Qt.AlignmentFlag.AlignCenter, label)
 
-        # USB port at bottom edge
+        # USB port at top or bottom edge
         usb_w = 2.6 * p if self.usb_type == "usbc" else 2.8 * p
         usb_h = 1.6 * p
         ux = cx - usb_w / 2.0
-        uy = by + bh - usb_h * 0.65
+        uy = (by - usb_h * 0.35) if self.usb_on_top else (by + bh - usb_h * 0.65)
         u_grad = QLinearGradient(ux, uy, ux + usb_w, uy)
         u_grad.setColorAt(0.0, QColor(175, 180, 188))
         u_grad.setColorAt(0.5, QColor(232, 236, 242))
@@ -181,15 +201,21 @@ class DualRowDevBoardDef(ComponentDef):
         painter.drawRoundedRect(QRectF(ux, uy, usb_w, usb_h), r_usb, r_usb)
 
         # RST / BOOT mini tactile buttons near USB
-        btn_y = by + bh - 2.35 * p
-        if btn_y > shield_y + shield_h + 0.2 * p:
+        btn_h = 0.65 * p
+        if self.usb_on_top:
+            btn_y = by + 2.35 * p - btn_h
+            can_draw_btns = (btn_y + btn_h) < (shield_y - 0.2 * p)
+        else:
+            btn_y = by + bh - 2.35 * p
+            can_draw_btns = btn_y > (shield_y + shield_h + 0.2 * p)
+        if can_draw_btns:
             for off in (-1.45 * p, 0.75 * p):
                 if abs(off) < bw * 0.35:
                     painter.setBrush(QColor(210, 215, 220))
                     painter.setPen(QPen(QColor(110, 115, 120), 0.7))
-                    painter.drawRoundedRect(QRectF(cx + off, btn_y, 0.85 * p, 0.65 * p), 1.0, 1.0)
+                    painter.drawRoundedRect(QRectF(cx + off, btn_y, 0.85 * p, btn_h), 1.0, 1.0)
                     painter.setBrush(QColor(45, 45, 50))
-                    painter.drawEllipse(QPointF(cx + off + 0.425 * p, btn_y + 0.325 * p), 0.18 * p, 0.18 * p)
+                    painter.drawEllipse(QPointF(cx + off + 0.425 * p, btn_y + btn_h * 0.5), 0.18 * p, 0.18 * p)
 
         # Pin header strips & silkscreen names
         header_w = 0.82 * p
@@ -358,11 +384,12 @@ class ESP32SuperMiniDef(DualRowDevBoardDef):
             right_names=right,
             row_span=6,
             pcb_colors=pcb,
-            pad_top=1.35,
-            pad_bottom=0.85,
+            pad_top=0.85,
+            pad_bottom=1.35,
             pad_side=0.5,
             usb_type="usbc",
             rf_antenna="ceramic",
+            usb_on_top=True,
             tags=tags
         )
 
