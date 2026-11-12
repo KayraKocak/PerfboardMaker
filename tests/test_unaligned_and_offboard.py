@@ -170,6 +170,31 @@ class UnalignedAndOffboardTests(unittest.TestCase):
         self.assertEqual([p.name for p in comp.pins], ["A4", "A5", "GND1"])
         self.assertEqual(sorted(p.name for p in comp.off_grid_pins), ["SCL", "SDA"])
 
+    def test_offboard_aligned_pin_connectable_via_jumper(self):
+        cv = CanvasView(BoardConfig(cols=16, rows=12))
+        try:
+            # Place a grid-aligned Arduino Nano outside the perfboard (col=-5, row=2)
+            inst = cv.add_component("arduino_nano", -5, 2)
+            pins = inst.get_pin_positions(REGISTRY.get("arduino_nano"))
+            pname, pc, pr, _ = pins[0]
+            self.assertFalse(cv.config.is_valid_hole(pc, pr))
+
+            px, py = cv.config.grid_to_board_pos(pc, pr)
+            snapped = cv._snap_jumper_endpoint(QPointF(px, py), pc, pr)
+            self.assertEqual(snapped, (pc, pr, None))
+
+            cv.solder_mgr.connect_holes((3, 3), (4, 3))
+            cv.add_jumper(pc, pr, 3, 3)
+            traces, jumpers = cv.get_conductive_net_at(pc, pr, QPointF(px, py))
+            self.assertEqual(len(jumpers), 1)
+            self.assertEqual(len(traces), 1)
+
+            sel = cv.build_solder_selection(traces[0])
+            self.assertEqual(sel.direct_pins, [])
+            self.assertTrue(any(p.pin_name == pname and p.via_jumper for p in sel.net_only_pins))
+        finally:
+            cv.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

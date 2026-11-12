@@ -1058,6 +1058,25 @@ class CanvasView(QGraphicsView):
                     best_hit = (inst, idx, pname, cf, rf)
         return best_hit
 
+    def _find_offboard_aligned_pin_at(
+        self, scene_pos: QPointF
+    ) -> tuple[PlacedComponent, int, int, str] | None:
+        """Returns closest grid-aligned pin outside perfboard bounds (instance, col, row, name) or None."""
+        thresh = self.config.pitch_px * 0.55
+        best_hit = None
+        best_dist = thresh
+        for c_item in self.component_items:
+            inst = c_item.instance
+            for pname, pc, pr, _ptype in inst.get_pin_positions(c_item.comp_def):
+                if self.config.is_valid_hole(pc, pr):
+                    continue
+                px, py = self.config.grid_to_board_pos(pc, pr)
+                d = math.hypot(scene_pos.x() - px, scene_pos.y() - py)
+                if d <= best_dist:
+                    best_dist = d
+                    best_hit = (inst, pc, pr, pname)
+        return best_hit
+
     def _snap_jumper_endpoint(
         self,
         scene_pos: QPointF,
@@ -1066,12 +1085,16 @@ class CanvasView(QGraphicsView):
         anchor_pt: tuple[int | float, int | float] | None = None,
         is_shift: bool = False,
     ) -> tuple[int | float, int | float, tuple[str, int, str] | None]:
-        """Snaps a jumper endpoint to an off-grid component pin if close, else to a clamped board hole."""
+        """Snaps a jumper endpoint to an off-grid pin, off-board aligned pin, or clamped board hole."""
         if not is_shift:
             pin_hit = self._find_off_grid_pin_at(scene_pos)
             if pin_hit is not None:
                 comp_inst, pin_idx, pin_name, cf, rf = pin_hit
                 return (cf, rf, (comp_inst.uid, pin_idx, pin_name))
+            offboard_hit = self._find_offboard_aligned_pin_at(scene_pos)
+            if offboard_hit is not None:
+                _, pc, pr, _ = offboard_hit
+                return (pc, pr, None)
 
         c_target, r_target = col, row
         if is_shift and anchor_pt is not None:
@@ -1314,18 +1337,27 @@ class CanvasView(QGraphicsView):
                     seed_nodes.add(p_node)
                     break
 
-        # 1b. Check direct hole match
-        if not seed_trace and not seed_jumper and self.config.is_valid_hole(col, row):
-            t = self.solder_mgr.find_trace_with_hole(col, row)
-            if t:
-                seed_trace = t
-                seed_nodes.add(("hole", col, row))
+        # 1b. Check direct hole or off-board aligned component pin match
+        if not seed_trace and not seed_jumper:
+            target_hole = None
+            if self.config.is_valid_hole(col, row):
+                target_hole = (col, row)
             else:
-                for j in self.jumpers:
-                    if (col, row) in (j.start_hole(), j.end_hole()):
-                        seed_jumper = j
-                        seed_nodes.add(("hole", col, row))
-                        break
+                offboard_hit = self._find_offboard_aligned_pin_at(scene_pos)
+                if offboard_hit is not None:
+                    target_hole = (offboard_hit[1], offboard_hit[2])
+            if target_hole is not None:
+                tc, tr = target_hole
+                t = self.solder_mgr.find_trace_with_hole(tc, tr) if self.config.is_valid_hole(tc, tr) else None
+                if t:
+                    seed_trace = t
+                    seed_nodes.add(("hole", tc, tr))
+                else:
+                    for j in self.jumpers:
+                        if (tc, tr) in (j.start_hole(), j.end_hole()):
+                            seed_jumper = j
+                            seed_nodes.add(("hole", tc, tr))
+                            break
 
         # 2. Check proximity to solder segments
         if not seed_trace and not seed_jumper:
@@ -2269,7 +2301,7 @@ class CanvasView(QGraphicsView):
                     event.accept()
                     return
 
-            # 3. Otherwise: start drawing a new straight jumper from off-grid pin or perfboard hole
+            # 3. Otherwise: start drawing a new straight jumper from off-grid pin, off-board aligned pin, or perfboard hole
             pin_hit = self._find_off_grid_pin_at(scene_pos)
             if pin_hit is not None:
                 comp_inst, pin_idx, pin_name, sc_val, sr_val = pin_hit
@@ -2289,17 +2321,25 @@ class CanvasView(QGraphicsView):
                 self._jumper_preview_item = JumperItem(preview_wire, self.config)
                 self._jumper_preview_item.setOpacity(0.8)
                 self.scene.addItem(self._jumper_preview_item)
-            elif self.config.is_valid_hole(col, row):
-                self._jumper_drag_active = True
-                self._jumper_start_hole = (col, row)
-                self._jumper_start_pin = None
-                preview_wire = JumperWire(
-                    start_col=col, start_row=row, end_col=col, end_row=row,
-                    color=self.active_jumper_color, side=self.config.view_side
-                )
-                self._jumper_preview_item = JumperItem(preview_wire, self.config)
-                self._jumper_preview_item.setOpacity(0.8)
-                self.scene.addItem(self._jumper_preview_item)
+            else:
+                offboard_hit = self._find_offboard_aligned_pin_at(scene_pos)
+                start_hole = None
+                if offboard_hit is not None:
+                    start_hole = (offboard_hit[1], offboard_hit[2])
+                elif self.config.is_valid_hole(col, row):
+                    start_hole = (col, row)
+                if start_hole is not None:
+                    sc, sr = start_hole
+                    self._jumper_drag_active = True
+                    self._jumper_start_hole = (sc, sr)
+                    self._jumper_start_pin = None
+                    preview_wire = JumperWire(
+                        start_col=sc, start_row=sr, end_col=sc, end_row=sr,
+                        color=self.active_jumper_color, side=self.config.view_side
+                    )
+                    self._jumper_preview_item = JumperItem(preview_wire, self.config)
+                    self._jumper_preview_item.setOpacity(0.8)
+                    self.scene.addItem(self._jumper_preview_item)
             event.accept()
             return
 
