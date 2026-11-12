@@ -347,6 +347,7 @@ class MainWindow(QMainWindow):
             cv.autoconnect_selection_changed.connect(self.properties.set_autoconnect_targets)
             cv.autoconnect_groups_changed.connect(self.properties.set_autoconnect_groups)
             cv.autoconnect_completed.connect(self._on_autoconnect_completed)
+            cv.cutout_selection_changed.connect(self.properties.set_selected_cutout)
 
         self.canvas.view_side_changed.connect(self._on_view_side_changed)
 
@@ -374,6 +375,12 @@ class MainWindow(QMainWindow):
         self.properties.clear_groups_requested.connect(self.canvas.clear_autoconnect_groups)
         self.properties.optimize_board_requested.connect(self._on_optimize_board_requested)
 
+        # Shape Perfboard triggers
+        self.properties.cutout_tool_changed.connect(self._on_cutout_tool_changed)
+        self.properties.cutout_modified.connect(self._on_cutout_modified)
+        self.properties.cutout_delete_requested.connect(self.canvas.remove_cutout_by_uid)
+        self.properties.cutouts_clear_requested.connect(self.canvas.clear_all_cutouts)
+
     def _setup_shortcuts(self):
         # Hotkeys 1, 2, 3, 4 for modes
         act_mode_1 = QAction("Select Mode", self)
@@ -395,6 +402,11 @@ class MainWindow(QMainWindow):
         act_mode_4.setShortcut(QKeySequence("4"))
         act_mode_4.triggered.connect(lambda: self._set_app_mode("autoconnect"))
         self.addAction(act_mode_4)
+
+        act_mode_5 = QAction("Shape Perfboard Mode", self)
+        act_mode_5.setShortcut(QKeySequence("5"))
+        act_mode_5.triggered.connect(lambda: self._set_app_mode("shape"))
+        self.addAction(act_mode_5)
 
         # AutoConnect grouping shortcuts
         act_group = QAction("Group Conductors", self)
@@ -545,6 +557,10 @@ class MainWindow(QMainWindow):
         self.act_mode_autoconnect.triggered.connect(lambda: self._set_app_mode("autoconnect"))
         view_menu.addAction(self.act_mode_autoconnect)
 
+        self.act_mode_shape = QAction("Shape Perfboard Mode (5)", self)
+        self.act_mode_shape.triggered.connect(lambda: self._set_app_mode("shape"))
+        view_menu.addAction(self.act_mode_shape)
+
     def _build_toolbar(self):
         tb = QToolBar("Main Toolbar", self)
         tb.setMovable(False)
@@ -644,14 +660,15 @@ class MainWindow(QMainWindow):
         self._sb_right_spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         sb.addWidget(self._sb_right_spacer, 8)
 
-        sb.addPermanentWidget(QLabel("1-4: Modes | Ctrl+G: Group | Enter: Connect | F: Flip"))
+        sb.addPermanentWidget(QLabel("1-5: Modes | Ctrl+G: Group | Enter: Connect | F: Flip"))
 
     def _update_mode_status(self, mode: str):
         mode_titles = {
             "select": "[MODE: SELECT (1)]",
             "solder": "[MODE: SOLDER (2)]",
             "jumper": "[MODE: JUMPER (3)]",
-            "autoconnect": "[MODE: AUTOCONNECT (4)]"
+            "autoconnect": "[MODE: AUTOCONNECT (4)]",
+            "shape": "[MODE: SHAPE PERFBOARD (5)]",
         }
         self.lbl_mode.setText(mode_titles.get(mode, "[MODE: SELECT]"))
 
@@ -836,7 +853,7 @@ class MainWindow(QMainWindow):
         # Update spinboxes live during drag without rebuilding layout; refresh full card on release
         if not (self.canvas._board_resize_active or self.canvas_back._board_resize_active):
             self.properties.refresh_view()
-        elif self.properties.active_mode != "autoconnect" and not self.properties.selected_item:
+        elif self.properties.active_mode not in ("autoconnect", "shape") and not self.properties.selected_item:
             for attr, val in (("spin_cols", cols), ("spin_rows", rows)):
                 spin = getattr(self.properties, attr, None)
                 if spin is not None:
@@ -847,6 +864,15 @@ class MainWindow(QMainWindow):
                     except RuntimeError:
                         pass
         self.statusBar().showMessage(f"Board size: {cols} x {rows} holes", 1500)
+
+    def _on_cutout_tool_changed(self, shape: str, corner_radius: float, inverted: bool):
+        self.canvas.set_cutout_tool(shape, corner_radius, inverted)
+        self.canvas_back.set_cutout_tool(shape, corner_radius, inverted)
+
+    def _on_cutout_modified(self):
+        self.canvas.board_item.update()
+        self.canvas.record_undo_snapshot()
+        self.canvas._notify_partner_sync(full=False)
 
     def _update_comp_count(self):
         c_cnt = len(self.canvas.placed_components)

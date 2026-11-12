@@ -2,12 +2,14 @@
 Procedural Perfboard QGraphicsItem.
 Renders the PCB substrate, donut pads, drilled holes, coordinate rulers, and corner mounting holes.
 """
+import math
 from PyQt6.QtWidgets import QGraphicsItem
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QRadialGradient, QLinearGradient
+    QPainter, QColor, QPen, QBrush, QFont, QRadialGradient, QLinearGradient,
+    QPainterPath, QTransform, QPolygonF
 )
 from PyQt6.QtCore import Qt, QRectF, QPointF
-from app.models.board import BoardConfig, col_index_to_name
+from app.models.board import BoardConfig, BoardCutout, col_index_to_name
 
 BOARD_THEMES = {
     "green": {
@@ -56,13 +58,100 @@ class BoardItem(QGraphicsItem):
         self.hovered_row = -1
         self.active_resize_edges = ""
         self.is_resizing = False
+        self.shape_mode_active = False
+        self.selected_cutout_uid: str | None = None
+        self.selected_vertex_idx: int | None = None
+        self.selected_vertex_indices: list[int] = []
+        self.drawing_custom_cutout: BoardCutout | None = None
+        self.drawing_custom_cursor: QPointF | None = None
+        self.custom_snap_guides: list[tuple[str, float]] = []
+        self.bevel_guide_line: tuple[QPointF, QPointF] | None = None
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setZValue(0)  # Board is background
 
+    def set_shape_mode(self, active: bool):
+        if self.shape_mode_active != active:
+            self.shape_mode_active = active
+            self.update()
+
+    def set_selected_cutout(self, uid: str | None):
+        if self.selected_cutout_uid != uid:
+            self.selected_cutout_uid = uid
+            self.selected_vertex_idx = None
+            self.selected_vertex_indices = []
+            self.update()
+
+    def set_selected_vertex(self, idx: int | None):
+        new_list = [idx] if idx is not None else []
+        if self.selected_vertex_idx != idx or self.selected_vertex_indices != new_list:
+            self.selected_vertex_idx = idx
+            self.selected_vertex_indices = new_list
+            self.update()
+
+    def set_selected_vertices(self, indices: list[int]):
+        new_list = list(indices)
+        new_primary = new_list[-1] if new_list else None
+        if self.selected_vertex_indices != new_list or self.selected_vertex_idx != new_primary:
+            self.selected_vertex_indices = new_list
+            self.selected_vertex_idx = new_primary
+            self.update()
+
+    def _cutout_display_rect(self, cutout: BoardCutout) -> QRectF:
+        if self.config.view_side == "bottom":
+            bx = self.config.width_px - (cutout.x + cutout.w)
+        else:
+            bx = cutout.x
+        return QRectF(bx, cutout.y, cutout.w, cutout.h)
+
+    def _cutout_display_rotation(self, cutout: BoardCutout) -> float:
+        return -cutout.rotation if self.config.view_side == "bottom" else cutout.rotation
+
+    def _cutout_display_vertices(self, cutout: BoardCutout) -> list[QPointF]:
+        is_bottom = (self.config.view_side == "bottom")
+        w_board = self.config.width_px
+        return [
+            QPointF((w_board - vx) if is_bottom else vx, vy)
+            for vx, vy in cutout.vertices
+        ]
+
+    def _cutout_display_transform(self, cutout: BoardCutout, rect: QRectF) -> QTransform:
+        rot = self._cutout_display_rotation(cutout)
+        t = QTransform()
+        if abs(rot) > 1e-6:
+            c = rect.center()
+            t.translate(c.x(), c.y())
+            t.rotate(rot)
+            t.translate(-c.x(), -c.y())
+        return t
+
+    def _cutout_display_path(self, cutout: BoardCutout) -> QPainterPath:
+        rect = self._cutout_display_rect(cutout)
+        path = QPainterPath()
+        if cutout.shape == "custom":
+            pts = self._cutout_display_vertices(cutout)
+            if len(pts) >= 3:
+                path.addPolygon(QPolygonF(pts))
+                path.closeSubpath()
+        elif cutout.shape == "rect":
+            path.addRect(rect)
+        elif cutout.shape == "rounded_rect":
+            cr = max(0.0, min(cutout.corner_radius, rect.width() * 0.5, rect.height() * 0.5))
+            path.addRoundedRect(rect, cr, cr)
+        elif cutout.shape in ("oval", "inverted_oval"):
+            path.addEllipse(rect)
+        t = self._cutout_display_transform(cutout, rect)
+        return t.map(path) if not t.isIdentity() else path
+
+    def _canvas_bg_color(self) -> QColor:
+        scene = self.scene()
+        if scene is not None and scene.backgroundBrush().style() != Qt.BrushStyle.NoBrush:
+            return scene.backgroundBrush().color()
+        return QColor("#1e1f22")
+
     def boundingRect(self) -> QRectF:
-        # Extra 12px margin around board for shadow, edge resize highlights, and labels
-        return QRectF(-12, -12, self.config.width_px + 24, self.config.height_px + 24)
+        # Extra 40px margin around board for shadow, edge resize highlights, rotation handles, and custom previews
+        return QRectF(-40, -40, self.config.width_px + 80, self.config.height_px + 80)
 
     def set_hovered_hole(self, col: int, row: int):
         if self.hovered_col != col or self.hovered_row != row:
@@ -180,6 +269,8 @@ class BoardItem(QGraphicsItem):
         # Pad gradient for realistic metallic donut ring
         for c in range(cfg.cols):
             for r in range(cfg.rows):
+                if cfg.is_hole_cut(c, r):
+                    continue
                 px, py = cfg.grid_to_board_pos(c, r)
 
                 # Annular copper pad
@@ -204,6 +295,177 @@ class BoardItem(QGraphicsItem):
                 painter.setBrush(hole_col)
                 painter.setPen(QPen(QColor(25, 25, 28), 0.6))
                 painter.drawEllipse(QPointF(px, py), hole_r, hole_r)
+
+        # 6b. Perfboard Cutout Shapes (rendered in canvas background color, no borders)
+        if cfg.cutouts:
+            bg_color = self._canvas_bg_color()
+            board_clip = QRectF(-12, -12, cfg.width_px + 24, cfg.height_px + 24)
+            painter.save()
+            painter.setClipRect(board_clip)
+
+            for cutout in cfg.cutouts:
+                shape_path = self._cutout_display_path(cutout)
+                if shape_path.isEmpty():
+                    continue
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(bg_color)
+                if cutout.is_inverted:
+                    inv_path = QPainterPath()
+                    inv_path.setFillRule(Qt.FillRule.OddEvenFill)
+                    inv_path.addRect(board_clip)
+                    inv_path.addPath(shape_path)
+                    painter.drawPath(inv_path)
+                else:
+                    painter.drawPath(shape_path)
+
+            painter.restore()
+
+            # In Shape Perfboard mode, show interactive outlines, resize/rotation/vertex handles
+            if self.shape_mode_active:
+                painter.save()
+                inv_zoom = 1.0 / max(0.15, abs(painter.worldTransform().m11()))
+                for cutout in cfg.cutouts:
+                    rect = self._cutout_display_rect(cutout)
+                    shape_path = self._cutout_display_path(cutout)
+                    if shape_path.isEmpty():
+                        continue
+                    is_sel = (cutout.uid == self.selected_cutout_uid)
+                    outline_pen = QPen(
+                        QColor(88, 101, 242, 235) if is_sel else QColor(148, 155, 164, 150),
+                        1.8 if is_sel else 1.1,
+                        Qt.PenStyle.SolidLine if is_sel else Qt.PenStyle.DashLine,
+                    )
+                    outline_pen.setCosmetic(True)
+                    painter.setPen(outline_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawPath(shape_path)
+
+                    if is_sel:
+                        t = self._cutout_display_transform(cutout, rect)
+                        if cutout.shape in ("oval", "inverted_oval", "custom") or cutout.is_inverted:
+                            box_pen = QPen(QColor(88, 101, 242, 110), 1.0, Qt.PenStyle.DashLine)
+                            box_pen.setCosmetic(True)
+                            painter.setPen(box_pen)
+                            painter.drawPolygon(t.map(QPolygonF(rect)))
+
+                        hs = 7.0 * inv_zoom
+                        half = hs * 0.5
+                        x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+                        xm, ym = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+                        local_handles = [
+                            (x1, y1), (xm, y1), (x2, y1), (x2, ym),
+                            (x2, y2), (xm, y2), (x1, y2), (x1, ym),
+                        ]
+                        top_mid = t.map(QPointF(xm, y1))
+                        rot_pt = t.map(QPointF(xm, y1 - 22.0 * inv_zoom))
+                        stem_pen = QPen(QColor(88, 101, 242, 220), 1.4)
+                        stem_pen.setCosmetic(True)
+                        painter.setPen(stem_pen)
+                        painter.drawLine(top_mid, rot_pt)
+                        handle_pen = QPen(QColor(255, 255, 255, 235), 1.0)
+                        handle_pen.setCosmetic(True)
+                        painter.setPen(handle_pen)
+                        painter.setBrush(QColor(0, 200, 255))
+                        rot_r = 4.5 * inv_zoom
+                        painter.drawEllipse(rot_pt, rot_r, rot_r)
+
+                        painter.setBrush(QColor(88, 101, 242))
+                        for hx, hy in local_handles:
+                            pt = t.map(QPointF(hx, hy))
+                            painter.drawRect(QRectF(pt.x() - half, pt.y() - half, hs, hs))
+
+                        if cutout.shape == "custom":
+                            disp_verts = self._cutout_display_vertices(cutout)
+                            v_pen = QPen(QColor(255, 255, 255, 240), 1.2)
+                            v_pen.setCosmetic(True)
+                            painter.setPen(v_pen)
+                            for v_idx, v_pt in enumerate(disp_verts):
+                                w_pt = t.map(v_pt)
+                                is_v_sel = (v_idx == self.selected_vertex_idx) or (v_idx in self.selected_vertex_indices)
+                                painter.setBrush(QColor(255, 196, 0) if is_v_sel else QColor(0, 220, 180))
+                                r_v = (5.5 if is_v_sel else 4.0) * inv_zoom
+                                painter.drawEllipse(w_pt, r_v, r_v)
+                painter.restore()
+
+        # 6c. Live Custom Shape drawing preview (open polygon)
+        if self.shape_mode_active and self.drawing_custom_cutout is not None:
+            pts = self._cutout_display_vertices(self.drawing_custom_cutout)
+            if pts:
+                painter.save()
+                inv_zoom = 1.0 / max(0.15, abs(painter.worldTransform().m11()))
+                # X/Y snap guides
+                if self.custom_snap_guides:
+                    guide_pen = QPen(QColor(0, 230, 255, 170), 1.0, Qt.PenStyle.DashLine)
+                    guide_pen.setCosmetic(True)
+                    painter.setPen(guide_pen)
+                    for axis, val in self.custom_snap_guides:
+                        if axis == "x":
+                            painter.drawLine(QPointF(val, -40), QPointF(val, cfg.height_px + 40))
+                        else:
+                            painter.drawLine(QPointF(-40, val), QPointF(cfg.width_px + 40, val))
+
+                edge_pen = QPen(QColor(0, 230, 255, 230), 1.8)
+                edge_pen.setCosmetic(True)
+                painter.setPen(edge_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                for i in range(len(pts) - 1):
+                    painter.drawLine(pts[i], pts[i + 1])
+                if self.drawing_custom_cursor is not None:
+                    rb_pen = QPen(QColor(0, 230, 255, 170), 1.4, Qt.PenStyle.DashLine)
+                    rb_pen.setCosmetic(True)
+                    painter.setPen(rb_pen)
+                    painter.drawLine(pts[-1], self.drawing_custom_cursor)
+                    if len(pts) >= 2:
+                        close_pen = QPen(QColor(0, 230, 255, 90), 1.0, Qt.PenStyle.DotLine)
+                        close_pen.setCosmetic(True)
+                        painter.setPen(close_pen)
+                        painter.drawLine(self.drawing_custom_cursor, pts[0])
+
+                v_pen = QPen(QColor(255, 255, 255, 240), 1.2)
+                v_pen.setCosmetic(True)
+                painter.setPen(v_pen)
+                for i, pt in enumerate(pts):
+                    painter.setBrush(QColor(255, 196, 0) if i == 0 else QColor(0, 220, 180))
+                    r_v = (5.0 if i == 0 else 4.0) * inv_zoom
+                    painter.drawEllipse(pt, r_v, r_v)
+                painter.restore()
+
+        # 6d. Bevel distance guide line
+        if self.shape_mode_active and self.bevel_guide_line is not None:
+            p_start, p_cur = self.bevel_guide_line
+            painter.save()
+            inv_zoom = 1.0 / max(0.15, abs(painter.worldTransform().m11()))
+            guide_pen = QPen(QColor(255, 210, 80, 230), 1.5, Qt.PenStyle.DashLine)
+            guide_pen.setCosmetic(True)
+            painter.setPen(guide_pen)
+            painter.drawLine(p_start, p_cur)
+
+            dot_pen = QPen(QColor(255, 255, 255, 230), 1.0)
+            dot_pen.setCosmetic(True)
+            painter.setPen(dot_pen)
+            painter.setBrush(QColor(255, 196, 0))
+            r_dot = 3.5 * inv_zoom
+            painter.drawEllipse(p_start, r_dot, r_dot)
+            painter.drawEllipse(p_cur, r_dot, r_dot)
+
+            dist_px = math.hypot(p_cur.x() - p_start.x(), p_cur.y() - p_start.y())
+            mid = QPointF((p_start.x() + p_cur.x()) * 0.5, (p_start.y() + p_cur.y()) * 0.5)
+            painter.translate(mid)
+            painter.scale(inv_zoom, inv_zoom)
+            font = QFont("Consolas", 9)
+            font.setBold(True)
+            painter.setFont(font)
+            label = f"{dist_px:.1f} px"
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(label) + 10
+            th = fm.height() + 4
+            box = QRectF(-tw * 0.5, -th - 6, tw, th)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(20, 22, 28, 200))
+            painter.drawRoundedRect(box, 3.0, 3.0)
+            painter.setPen(QColor(255, 220, 110))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, label)
+            painter.restore()
 
         # 7. Hover Reticle Highlight
         if cfg.is_valid_hole(self.hovered_col, self.hovered_row):

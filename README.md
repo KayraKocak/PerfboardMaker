@@ -31,6 +31,12 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
   - **Cost Weight Presets & Live Tuning**: Adjust routing weights (*Solder Move*, *Solder Turn*, *Jumper Start*, *Jumper Move*, *Jumper Turn*, *Jumper Cross*) in real time, switch between **`Balanced`**, **`More jumper`**, and **`More solder`**, or save custom presets.
 
 ![Optimize Board Feature & Presets](images/OptimizeBoardFeature.png)
+- **Shape Perfboard Mode (`5`)**:
+  - Cut custom board outlines and cutouts using **Rectangle**, **Rounded Rectangle**, **Oval**, **Inverted Oval**, or **Custom Shape**, with an **Invert Shape** toggle to cut either inside or outside any shape.
+  - Holes completely covered by a cutter shape are automatically disabled. Cutouts are borderless, freeform (not grid-snapped), and support **click-through selection cycling** across overlapping shapes, **move/resize**, and **rotation** (`Shift` for relative 15° snap, `Ctrl+Shift` for absolute world 15° snap).
+  - **Custom Shape & Blender-Style Vertex Bevel (`Ctrl+B`)**: Click to place closed polygon vertices with 5-pixel X/Y auto-alignment, drag vertices to adjust, **`Shift+Click`** to multi-select vertices, and press **`Ctrl+B`** to dynamically bevel one or more vertices simultaneously (move mouse to set radius, scroll wheel for `0–20` curve segments, left-click to apply, right-click/`Esc` to cancel).
+
+![Shape Perfboard Mode](images/Shape%20Board.png)
 
 ### 2. Multi-View & Inspection Tools
 - **Top & Bottom 2D Orthogonal Views (`F`)**:
@@ -67,7 +73,7 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
 
 | Shortcut | Action |
 | :--- | :--- |
-| **`1` / `2` / `3` / `4`** | Switch between Select / Solder / Jumper / AutoConnect modes |
+| **`1` / `2` / `3` / `4` / `5`** | Switch between Select / Solder / Jumper / AutoConnect / Shape Perfboard modes |
 | **`F`** | Flip board view (Top / Bottom) |
 | **`R` / `Shift+R`** | Rotate selected or ghost component 90° CW / CCW |
 | **`LCtrl` + Click/Drag** *(Solder)* | Erase solder holes or bridges |
@@ -75,6 +81,9 @@ A desktop 2D orthogonal electronic CAD application for designing, routing, and p
 | **`Shift` while drawing** | Lock trace or jumper to horizontal / vertical |
 | **`Ctrl+G` / `Ctrl+Shift+G`** *(AutoConnect)* | Group / ungroup selected conductors |
 | **`Enter`** *(AutoConnect)* | Run AutoConnect routing |
+| **`Shift` + Click** *(Shape vertex)* | Multi-select custom-shape vertices |
+| **`Ctrl+B`** *(Shape Perfboard)* | Bevel selected vertex/vertices (Mouse: radius, Wheel: `0–20` curve points, Left-click: apply, Right-click/`Esc`: cancel) |
+| **`Shift` / `Ctrl+Shift` while rotating** *(Shape)* | Snap cutout rotation to 15° (relative / absolute world) |
 | **`Delete` / `Backspace`** | Delete selected component, jumper, or solder path |
 | **`Esc`** | Clear current selection or cancel active tool action |
 | **`Space + Drag` / `Middle` / `Right Drag`** | Pan canvas |

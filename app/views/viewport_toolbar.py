@@ -117,6 +117,14 @@ class ViewportToolbar(QFrame):
         self.btn_group.addButton(self.btn_autoconnect)
         layout.addWidget(self.btn_autoconnect)
 
+        self.btn_shape = QPushButton("✂️ Shape Perfboard (5)")
+        self.btn_shape.setCheckable(True)
+        self.btn_shape.setProperty("class", "mode-btn")
+        self.btn_shape.setToolTip("Cut shapes out of the perfboard (Hotkey: 5)")
+        self.btn_shape.clicked.connect(lambda: self.set_mode("shape"))
+        self.btn_group.addButton(self.btn_shape)
+        layout.addWidget(self.btn_shape)
+
         # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -153,7 +161,7 @@ class ViewportToolbar(QFrame):
         layout.addWidget(self.lbl_hint)
 
     def set_mode(self, mode: str):
-        if mode not in ("select", "solder", "jumper", "autoconnect"):
+        if mode not in ("select", "solder", "jumper", "autoconnect", "shape"):
             return
         self.current_mode = mode
 
@@ -172,6 +180,10 @@ class ViewportToolbar(QFrame):
         elif mode == "autoconnect":
             self.btn_autoconnect.setChecked(True)
             self.lbl_hint.setText("🔗 AutoConnect Mode: Select pins, traces, or jumper ends (Shift for multi). Press Enter to connect.")
+            self.swatch_container.setVisible(False)
+        elif mode == "shape":
+            self.btn_shape.setChecked(True)
+            self.lbl_hint.setText("✂️ Shape Perfboard: Drag to cut a shape, click to select, drag handles to resize. Del to remove.")
             self.swatch_container.setVisible(False)
 
         self.mode_changed.emit(mode)

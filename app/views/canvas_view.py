@@ -12,10 +12,10 @@ from typing import Any
 from collections import deque
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsItem
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QWheelEvent, QMouseEvent, QKeyEvent, QTransform, QKeySequence
+    QPainter, QColor, QPen, QBrush, QWheelEvent, QMouseEvent, QKeyEvent, QTransform, QKeySequence, QCursor
 )
 from PyQt6.QtCore import Qt, QPointF, pyqtSignal, QRectF
-from app.models.board import BoardConfig, col_index_to_name
+from app.models.board import BoardConfig, BoardCutout, col_index_to_name
 from app.models.placed_component import PlacedComponent
 from app.models.solder import SolderManager, SolderTrace, ConnectedPinInfo, SelectedSolderPath
 from app.models.jumper import JumperWire, DEFAULT_JUMPER_COLOR
@@ -82,6 +82,7 @@ class CanvasView(QGraphicsView):
     autoconnect_groups_changed = pyqtSignal(list)    # list of AutoConnectGroup
     autoconnect_completed = pyqtSignal(dict)        # result dictionary
     board_resized = pyqtSignal(int, int)            # cols, rows
+    cutout_selection_changed = pyqtSignal(object)   # str uid or None
 
     def __init__(self, config: BoardConfig, parent=None, primary_view: "CanvasView | None" = None):
         super().__init__(parent)
@@ -97,11 +98,39 @@ class CanvasView(QGraphicsView):
 
         self.scene = QGraphicsScene(self)
         self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
+        self.scene.setBackgroundBrush(QBrush(QColor("#1e1f22")))
         self.setScene(self.scene)
 
         # Mode
-        self.current_mode = "select"  # "select", "solder", "jumper", "autoconnect"
+        self.current_mode = "select"  # "select", "solder", "jumper", "autoconnect", "shape"
         self.active_jumper_color = DEFAULT_JUMPER_COLOR
+
+        # Shape Perfboard state
+        self.active_cutout_shape: str = "rect"
+        self.active_cutout_corner_radius: float = 12.0
+        self.active_cutout_inverted: bool = False
+        self.selected_cutout_uid: str | None = None
+        self.selected_vertex_idx: int | None = None
+        self.selected_vertex_indices: list[int] = []
+        self._cutout_drag_mode: str | None = None
+        self._cutout_resize_handle: str = ""
+        self._cutout_drag_start_board: QPointF = QPointF()
+        self._cutout_orig_rect: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self._cutout_orig_vertices: list[tuple[float, float]] = []
+        self._cutout_rot_start_angle: float = 0.0
+        self._cutout_rot_orig: float = 0.0
+        self._cutout_drag_changed: bool = False
+        self._cutout_click_hits: list[BoardCutout] = []
+        self._cutout_click_was_selected: bool = False
+        self._drawing_custom_cutout: BoardCutout | None = None
+        self._bevel_active: bool = False
+        self._bevel_cutout_uid: str | None = None
+        self._bevel_vertex_idx: int = -1
+        self._bevel_vertex_indices: list[int] = []
+        self._bevel_orig_vertices: list[tuple[float, float]] = []
+        self._bevel_segments: int = 4
+        self._bevel_last_dist: float = 20.0
+        self._bevel_start_pos: QPointF | None = None
 
         # AutoConnect mode state & overlay (shared when secondary view)
         if primary_view is not None:
@@ -228,6 +257,21 @@ class CanvasView(QGraphicsView):
         target.config.style = self.config.style
         target.config.transparent = bool(getattr(self.config, "transparent", False))
         target.config.transparent_components = bool(getattr(self.config, "transparent_components", False))
+        target.config.cutouts = [
+            BoardCutout(
+                shape=c.shape,
+                x=c.x,
+                y=c.y,
+                w=c.w,
+                h=c.h,
+                corner_radius=c.corner_radius,
+                rotation=c.rotation,
+                inverted=c.inverted,
+                vertices=list(c.vertices),
+                uid=c.uid,
+            )
+            for c in getattr(self.config, "cutouts", [])
+        ]
 
     def _notify_partner_sync(self, full: bool = True):
         partner = self._partner_view
@@ -483,7 +527,7 @@ class CanvasView(QGraphicsView):
         painter.restore()
 
     def set_mode(self, mode: str):
-        if mode not in ("select", "solder", "jumper", "autoconnect"):
+        if mode not in ("select", "solder", "jumper", "autoconnect", "shape"):
             return
         if self.current_mode == mode:
             return
@@ -494,6 +538,13 @@ class CanvasView(QGraphicsView):
         # Update solder item ghost mode
         self.solder_item.set_solder_mode(mode == "solder")
         self._clear_net_highlight()
+
+        # Update board item shape mode
+        is_shape = (mode == "shape")
+        self.board_item.set_shape_mode(is_shape)
+        if not is_shape:
+            self._cutout_drag_mode = None
+            self._cutout_resize_handle = ""
 
         # Update AutoConnect overlay
         is_ac = (mode == "autoconnect")
@@ -544,8 +595,370 @@ class CanvasView(QGraphicsView):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             elif self.current_mode == "autoconnect":
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+            elif self.current_mode == "shape":
+                self.setCursor(Qt.CursorShape.CrossCursor)
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def set_cutout_tool(self, shape: str, corner_radius: float, inverted: bool = False):
+        self.active_cutout_shape = shape
+        self.active_cutout_corner_radius = float(corner_radius)
+        self.active_cutout_inverted = bool(inverted)
+        if shape != "custom" and self._drawing_custom_cutout is not None:
+            self._cancel_custom_drawing()
+
+    def _get_selected_cutout(self) -> BoardCutout | None:
+        if not self.selected_cutout_uid:
+            return None
+        return next((c for c in self.config.cutouts if c.uid == self.selected_cutout_uid), None)
+
+    def _select_cutout(self, uid: str | None):
+        if self.selected_cutout_uid != uid:
+            self.selected_cutout_uid = uid
+            self.selected_vertex_idx = None
+            self.selected_vertex_indices = []
+            self.board_item.set_selected_cutout(uid)
+            self.cutout_selection_changed.emit(uid)
+        else:
+            self.board_item.update()
+
+    def _select_vertex(self, idx: int | None, toggle: bool = False):
+        if idx is None:
+            self.selected_vertex_indices = []
+            self.selected_vertex_idx = None
+        elif toggle:
+            if idx in self.selected_vertex_indices:
+                self.selected_vertex_indices.remove(idx)
+            else:
+                self.selected_vertex_indices.append(idx)
+            self.selected_vertex_idx = self.selected_vertex_indices[-1] if self.selected_vertex_indices else None
+        else:
+            self.selected_vertex_indices = [idx]
+            self.selected_vertex_idx = idx
+        self.board_item.set_selected_vertices(self.selected_vertex_indices)
+
+    def _cutout_display_rect(self, cutout: BoardCutout) -> QRectF:
+        if self.config.view_side == "bottom":
+            bx = self.config.width_px - (cutout.x + cutout.w)
+        else:
+            bx = cutout.x
+        return QRectF(bx, cutout.y, cutout.w, cutout.h)
+
+    def _set_cutout_from_display_rect(self, cutout: BoardCutout, rect: QRectF):
+        norm = rect.normalized()
+        w = max(4.0, norm.width())
+        h = max(4.0, norm.height())
+        if self.config.view_side == "bottom":
+            cutout.x = self.config.width_px - (norm.left() + w)
+        else:
+            cutout.x = norm.left()
+        cutout.y = norm.top()
+        cutout.w = w
+        cutout.h = h
+
+    def _board_to_cutout_local_display(self, board_pos: QPointF, cutout: BoardCutout) -> QPointF:
+        rect = self._cutout_display_rect(cutout)
+        rot = -cutout.rotation if self.config.view_side == "bottom" else cutout.rotation
+        if abs(rot) <= 1e-6:
+            return board_pos
+        c = rect.center()
+        t = QTransform()
+        t.translate(c.x(), c.y())
+        t.rotate(-rot)
+        t.translate(-c.x(), -c.y())
+        return t.map(board_pos)
+
+    def _cutout_local_display_to_board(self, local_pos: QPointF, cutout: BoardCutout) -> QPointF:
+        rect = self._cutout_display_rect(cutout)
+        rot = -cutout.rotation if self.config.view_side == "bottom" else cutout.rotation
+        if abs(rot) <= 1e-6:
+            return local_pos
+        c = rect.center()
+        t = QTransform()
+        t.translate(c.x(), c.y())
+        t.rotate(rot)
+        t.translate(-c.x(), -c.y())
+        return t.map(local_pos)
+
+    def _hit_test_cutout_rot_handle(self, board_pos: QPointF, cutout: BoardCutout) -> bool:
+        rect = self._cutout_display_rect(cutout)
+        local_pos = self._board_to_cutout_local_display(board_pos, cutout)
+        inv_zoom = 1.0 / max(0.15, self._zoom_factor)
+        tol = 8.0 * inv_zoom
+        hx = (rect.left() + rect.right()) * 0.5
+        hy = rect.top() - 22.0 * inv_zoom
+        return math.hypot(local_pos.x() - hx, local_pos.y() - hy) <= tol
+
+    def _hit_test_cutout_vertex(self, board_pos: QPointF, cutout: BoardCutout) -> int | None:
+        if cutout.shape != "custom" or not cutout.vertices:
+            return None
+        local_pos = self._board_to_cutout_local_display(board_pos, cutout)
+        tol = 8.0 / max(0.15, self._zoom_factor)
+        is_bottom = (self.config.view_side == "bottom")
+        w_board = self.config.width_px
+        for idx, (vx, vy) in enumerate(cutout.vertices):
+            dx = (w_board - vx) if is_bottom else vx
+            if math.hypot(local_pos.x() - dx, local_pos.y() - vy) <= tol:
+                return idx
+        return None
+
+    def _hit_test_cutout_handle(self, board_pos: QPointF, cutout: BoardCutout) -> str:
+        rect = self._cutout_display_rect(cutout)
+        local_pos = self._board_to_cutout_local_display(board_pos, cutout)
+        tol = 8.0 / max(0.15, self._zoom_factor)
+        x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+        xm, ym = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        handles = (
+            ("TL", x1, y1), ("T", xm, y1), ("TR", x2, y1), ("R", x2, ym),
+            ("BR", x2, y2), ("B", xm, y2), ("BL", x1, y2), ("L", x1, ym),
+        )
+        for name, hx, hy in handles:
+            if abs(local_pos.x() - hx) <= tol and abs(local_pos.y() - hy) <= tol:
+                return name
+        return ""
+
+    def _hit_test_cutouts(self, board_pos: QPointF) -> list[BoardCutout]:
+        """Returns all cutouts hit at board_pos ordered from topmost to bottommost."""
+        cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
+        cy = board_pos.y()
+        hits: list[BoardCutout] = []
+        for cutout in reversed(self.config.cutouts):
+            if cutout.is_inverted:
+                lx, ly = cutout._to_local(cx, cy)
+                if (
+                    cutout.x - 6.0 <= lx <= cutout.x + cutout.w + 6.0
+                    and cutout.y - 6.0 <= ly <= cutout.y + cutout.h + 6.0
+                ) or cutout.contains_point(cx, cy):
+                    hits.append(cutout)
+            elif cutout.contains_point(cx, cy):
+                hits.append(cutout)
+        return hits
+
+    def _hit_test_cutout(self, board_pos: QPointF) -> BoardCutout | None:
+        hits = self._hit_test_cutouts(board_pos)
+        return hits[0] if hits else None
+
+    def _snap_custom_vertex(
+        self,
+        canon_x: float,
+        canon_y: float,
+        other_verts: list[tuple[float, float]],
+    ) -> tuple[float, float, list[tuple[str, float]]]:
+        """Auto-aligns X/Y to within 5 actual viewport pixels of other vertices."""
+        thresh = 5.0 / max(0.05, self._zoom_factor)
+        best_x = canon_x
+        best_dx = thresh
+        snapped_x = False
+        best_y = canon_y
+        best_dy = thresh
+        snapped_y = False
+        for ox, oy in other_verts:
+            dx = abs(canon_x - ox)
+            if dx <= best_dx:
+                best_dx = dx
+                best_x = ox
+                snapped_x = True
+            dy = abs(canon_y - oy)
+            if dy <= best_dy:
+                best_dy = dy
+                best_y = oy
+                snapped_y = True
+
+        guides: list[tuple[str, float]] = []
+        is_bottom = (self.config.view_side == "bottom")
+        if snapped_x:
+            gx = (self.config.width_px - best_x) if is_bottom else best_x
+            guides.append(("x", gx))
+        if snapped_y:
+            guides.append(("y", best_y))
+        return best_x, best_y, guides
+
+    def _finish_custom_drawing(self):
+        c = self._drawing_custom_cutout
+        self._drawing_custom_cutout = None
+        self.board_item.drawing_custom_cutout = None
+        self.board_item.drawing_custom_cursor = None
+        self.board_item.custom_snap_guides = []
+        if c is not None and len(c.vertices) >= 3:
+            c.recompute_custom_bounds()
+            self.config.cutouts.append(c)
+            self._select_cutout(c.uid)
+            self.record_undo_snapshot()
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+
+    def _cancel_custom_drawing(self):
+        self._drawing_custom_cutout = None
+        self.board_item.drawing_custom_cutout = None
+        self.board_item.drawing_custom_cursor = None
+        self.board_item.custom_snap_guides = []
+        self.board_item.update()
+
+    @staticmethod
+    def _compute_multi_bevel_vertices(
+        orig_verts: list[tuple[float, float]],
+        v_indices: list[int] | set[int],
+        radius: float,
+        segments: int,
+    ) -> list[tuple[float, float]]:
+        n = len(orig_verts)
+        selected = {idx for idx in v_indices if 0 <= idx < n}
+        if n < 3 or not selected:
+            return list(orig_verts)
+
+        r = max(1.0, radius)
+        segs = max(0, min(20, int(segments)))
+        result: list[tuple[float, float]] = []
+
+        for i in range(n):
+            if i not in selected:
+                result.append(orig_verts[i])
+                continue
+            prev_idx = (i - 1) % n
+            next_idx = (i + 1) % n
+            px, py = orig_verts[i]
+            ax, ay = orig_verts[prev_idx]
+            bx, by = orig_verts[next_idx]
+            la = math.hypot(ax - px, ay - py)
+            lb = math.hypot(bx - px, by - py)
+            if la <= 1e-6 or lb <= 1e-6:
+                result.append(orig_verts[i])
+                continue
+
+            # If neighbor is also being beveled simultaneously, each end stops at 49% (2% gap between ends);
+            # if neighbor is stationary, this end can advance up to 98% (2% gap before stationary vertex).
+            limit_a = la * (0.49 if prev_idx in selected else 0.98)
+            limit_b = lb * (0.49 if next_idx in selected else 0.98)
+            da = min(r, limit_a)
+            db = min(r, limit_b)
+
+            ux, uy = (ax - px) / la, (ay - py) / la
+            vx, vy = (bx - px) / lb, (by - py) / lb
+            sx, sy = px + ux * da, py + uy * da
+            ex, ey = px + vx * db, py + vy * db
+
+            if segs == 0:
+                result.extend([(sx, sy), (ex, ey)])
+            else:
+                ox = sx + ex - px
+                oy = sy + ey - py
+                sox, soy = sx - ox, sy - oy
+                eox, eoy = ex - ox, ey - oy
+                result.append((sx, sy))
+                for k in range(1, segs + 1):
+                    theta = (math.pi * 0.5) * (k / (segs + 1))
+                    c_t = math.cos(theta)
+                    s_t = math.sin(theta)
+                    result.append((ox + sox * c_t + eox * s_t, oy + soy * c_t + eoy * s_t))
+                result.append((ex, ey))
+
+        return result
+
+    @staticmethod
+    def _compute_bevel_vertices(
+        orig_verts: list[tuple[float, float]],
+        v_idx: int,
+        radius: float,
+        segments: int,
+    ) -> list[tuple[float, float]]:
+        return CanvasView._compute_multi_bevel_vertices(orig_verts, [v_idx], radius, segments)
+
+    def _start_bevel(self) -> bool:
+        sel = self._get_selected_cutout()
+        if sel is None or sel.shape != "custom" or len(sel.vertices) < 3:
+            return False
+        valid_indices = [idx for idx in self.selected_vertex_indices if 0 <= idx < len(sel.vertices)]
+        if not valid_indices and self.selected_vertex_idx is not None and 0 <= self.selected_vertex_idx < len(sel.vertices):
+            valid_indices = [self.selected_vertex_idx]
+        if not valid_indices:
+            return False
+        self._bevel_active = True
+        self._bevel_cutout_uid = sel.uid
+        self._bevel_vertex_indices = valid_indices
+        self._bevel_vertex_idx = valid_indices[0]
+        self._bevel_orig_vertices = list(sel.vertices)
+        vp_pos = self.viewport().mapFromGlobal(QCursor.pos())
+        start_board = self.board_item.mapFromScene(self.mapToScene(vp_pos))
+        self._bevel_start_pos = start_board
+        self.board_item.bevel_guide_line = (start_board, start_board)
+        self._bevel_last_dist = 1.0
+        self._update_bevel_preview(self._bevel_last_dist)
+        return True
+
+    def _update_bevel_preview(self, dist: float):
+        if not self._bevel_active:
+            return
+        sel = next((c for c in self.config.cutouts if c.uid == self._bevel_cutout_uid), None)
+        if sel is None:
+            self._cancel_bevel()
+            return
+        self._bevel_last_dist = max(1.0, dist)
+        sel.vertices = self._compute_multi_bevel_vertices(
+            self._bevel_orig_vertices, self._bevel_vertex_indices, self._bevel_last_dist, self._bevel_segments
+        )
+        sel.recompute_custom_bounds()
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+
+    def _commit_bevel(self):
+        if not self._bevel_active:
+            return
+        self._bevel_active = False
+        self._bevel_cutout_uid = None
+        self._bevel_vertex_idx = -1
+        self._bevel_vertex_indices = []
+        self._bevel_orig_vertices = []
+        self._bevel_start_pos = None
+        self.board_item.bevel_guide_line = None
+        self._select_vertex(None)
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+        self.record_undo_snapshot()
+
+    def _cancel_bevel(self):
+        if not self._bevel_active:
+            return
+        sel = next((c for c in self.config.cutouts if c.uid == self._bevel_cutout_uid), None)
+        if sel is not None and self._bevel_orig_vertices:
+            sel.vertices = list(self._bevel_orig_vertices)
+            sel.recompute_custom_bounds()
+        self._bevel_active = False
+        self._bevel_cutout_uid = None
+        self._bevel_vertex_idx = -1
+        self._bevel_vertex_indices = []
+        self._bevel_orig_vertices = []
+        self._bevel_start_pos = None
+        self.board_item.bevel_guide_line = None
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+
+    def remove_cutout_by_uid(self, uid: str):
+        idx = next((i for i, c in enumerate(self.config.cutouts) if c.uid == uid), -1)
+        if idx < 0:
+            return
+        self.config.cutouts.pop(idx)
+        if self.selected_cutout_uid == uid:
+            self.selected_cutout_uid = None
+            self.selected_vertex_idx = None
+            self.selected_vertex_indices = []
+            self.board_item.set_selected_cutout(None)
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+        self.record_undo_snapshot()
+        self.cutout_selection_changed.emit(self.selected_cutout_uid)
+
+    def clear_all_cutouts(self):
+        if not self.config.cutouts:
+            return
+        self.config.cutouts.clear()
+        self.selected_cutout_uid = None
+        self.selected_vertex_idx = None
+        self.selected_vertex_indices = []
+        self.board_item.set_selected_cutout(None)
+        self.board_item.update()
+        self._notify_partner_sync(full=False)
+        self.record_undo_snapshot()
+        self.cutout_selection_changed.emit(None)
 
     def set_active_jumper_color(self, hex_color: str):
         self.active_jumper_color = hex_color
@@ -890,6 +1303,31 @@ class CanvasView(QGraphicsView):
             self.config.view_side = "top"
         else:
             self.config.view_side = b_data.get("view_side", self.config.view_side)
+
+        self.config.cutouts = [
+            BoardCutout(
+                shape=c_data.get("shape", "rect"),
+                x=float(c_data.get("x", 0.0)),
+                y=float(c_data.get("y", 0.0)),
+                w=float(c_data.get("w", 60.0)),
+                h=float(c_data.get("h", 60.0)),
+                corner_radius=float(c_data.get("corner_radius", 12.0)),
+                rotation=float(c_data.get("rotation", 0.0)),
+                inverted=bool(c_data.get("inverted", False)),
+                vertices=[
+                    (float(v[0]), float(v[1]))
+                    for v in c_data.get("vertices", [])
+                    if isinstance(v, (list, tuple)) and len(v) >= 2
+                ],
+                uid=c_data.get("uid") or BoardCutout().uid,
+            )
+            for c_data in b_data.get("cutouts", [])
+            if isinstance(c_data, dict)
+        ]
+        if self.selected_cutout_uid and not any(c.uid == self.selected_cutout_uid for c in self.config.cutouts):
+            self.selected_cutout_uid = None
+            self.board_item.set_selected_cutout(None)
+            self.cutout_selection_changed.emit(None)
 
         # 3. Clear existing components
         for it in list(self.component_items):
@@ -2028,6 +2466,10 @@ class CanvasView(QGraphicsView):
             self.recalculate_autoconnect()
 
     def remove_selected_item(self):
+        if self.current_mode == "shape" and self.selected_cutout_uid:
+            self.remove_cutout_by_uid(self.selected_cutout_uid)
+            return
+
         comp = self.get_selected_component_item()
         if comp:
             log_action("Delete Component", f"type={comp.instance.type_id}, pos=({comp.instance.grid_x},{comp.instance.grid_y}), rot={comp.instance.rotation}")
@@ -2143,17 +2585,47 @@ class CanvasView(QGraphicsView):
     # Mouse & Keyboard Event Handling
     def wheelEvent(self, event: QWheelEvent):
         delta = event.angleDelta().y()
+        if self._bevel_active:
+            step = 1 if delta > 0 else (-1 if delta < 0 else 0)
+            if step != 0:
+                self._bevel_segments = max(0, min(20, self._bevel_segments + step))
+                self._update_bevel_preview(self._bevel_last_dist)
+            event.accept()
+            return
+
         factor = 1.15 if delta > 0 else (1.0 / 1.15 if delta < 0 else 1.0)
         new_zoom = self._zoom_factor * factor
         if 0.15 <= new_zoom <= 8.0:
             self._zoom_factor = new_zoom
             self.scale(factor, factor)
             self.mirror_camera_to_partner()
+            scene_pos = self.mapToScene(event.position().toPoint())
             if self._double_view_active and self._partner_view is not None:
-                scene_pos = self.mapToScene(event.position().toPoint())
                 self._partner_view.set_mirrored_cursor_pos(
                     QPointF(self.config.width_px - scene_pos.x(), scene_pos.y())
                 )
+            if self.current_mode == "shape" and self._drawing_custom_cutout is not None:
+                board_pos = self.board_item.mapFromScene(scene_pos)
+                cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
+                cy = board_pos.y()
+                sx, sy, guides = self._snap_custom_vertex(cx, cy, self._drawing_custom_cutout.vertices)
+                dx_disp = (self.config.width_px - sx) if self.config.view_side == "bottom" else sx
+                self.board_item.drawing_custom_cursor = QPointF(dx_disp, sy)
+                self.board_item.custom_snap_guides = guides
+                self.board_item.update()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.current_mode == "shape"
+            and self._drawing_custom_cutout is not None
+        ):
+            if len(self._drawing_custom_cutout.vertices) >= 3:
+                self._finish_custom_drawing()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
         # Pan handlers
@@ -2164,6 +2636,14 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         elif event.button() == Qt.MouseButton.RightButton:
+            if self._bevel_active:
+                self._cancel_bevel()
+                event.accept()
+                return
+            if self._drawing_custom_cutout is not None:
+                self._cancel_custom_drawing()
+                event.accept()
+                return
             if self.placement_type_id:
                 self.cancel_placement_mode()
                 event.accept()
@@ -2198,6 +2678,134 @@ class CanvasView(QGraphicsView):
         # Placement mode click (allowed both on and outside the perfboard)
         if event.button() == Qt.MouseButton.LeftButton and self.placement_type_id:
             self.add_component(self.placement_type_id, col, row, self.placement_rotation)
+            event.accept()
+            return
+
+        # SHAPE PERFBOARD MODE (5)
+        if event.button() == Qt.MouseButton.LeftButton and self.current_mode == "shape":
+            board_pos = self.board_item.mapFromScene(scene_pos)
+            if self._bevel_active:
+                self._commit_bevel()
+                event.accept()
+                return
+
+            if self._drawing_custom_cutout is not None:
+                verts = self._drawing_custom_cutout.vertices
+                if len(verts) >= 3:
+                    v0x, v0y = verts[0]
+                    d0x = (self.config.width_px - v0x) if self.config.view_side == "bottom" else v0x
+                    if math.hypot(board_pos.x() - d0x, board_pos.y() - v0y) <= 10.0 / max(0.25, self._zoom_factor):
+                        self._finish_custom_drawing()
+                        event.accept()
+                        return
+                cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
+                cy = board_pos.y()
+                sx, sy, _ = self._snap_custom_vertex(cx, cy, verts)
+                verts.append((sx, sy))
+                self.board_item.update()
+                event.accept()
+                return
+
+            self._cutout_click_hits = []
+            self._cutout_click_was_selected = False
+            sel_cutout = self._get_selected_cutout()
+            if sel_cutout is not None:
+                if self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
+                    rect = self._cutout_display_rect(sel_cutout)
+                    center = rect.center()
+                    self._cutout_drag_mode = "rotate"
+                    self._cutout_drag_start_board = board_pos
+                    self._cutout_rot_start_angle = math.degrees(
+                        math.atan2(board_pos.y() - center.y(), board_pos.x() - center.x())
+                    )
+                    self._cutout_rot_orig = sel_cutout.rotation
+                    self._cutout_drag_changed = False
+                    event.accept()
+                    return
+
+                v_idx = self._hit_test_cutout_vertex(board_pos, sel_cutout)
+                if v_idx is not None:
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                        self._select_vertex(v_idx, toggle=True)
+                        event.accept()
+                        return
+                    self._select_vertex(v_idx, toggle=False)
+                    self._cutout_drag_mode = "move_vertex"
+                    self._cutout_drag_start_board = board_pos
+                    self._cutout_orig_vertices = list(sel_cutout.vertices)
+                    self._cutout_drag_changed = False
+                    event.accept()
+                    return
+
+                handle = self._hit_test_cutout_handle(board_pos, sel_cutout)
+                if handle:
+                    rect = self._cutout_display_rect(sel_cutout)
+                    self._cutout_drag_mode = "resize"
+                    self._cutout_resize_handle = handle
+                    self._cutout_drag_start_board = board_pos
+                    self._cutout_orig_rect = (rect.left(), rect.top(), rect.width(), rect.height())
+                    self._cutout_orig_vertices = list(sel_cutout.vertices)
+                    self._cutout_drag_changed = False
+                    event.accept()
+                    return
+
+            hits = self._hit_test_cutouts(board_pos)
+            if hits:
+                self._cutout_click_hits = hits
+                if self.selected_cutout_uid and any(c.uid == self.selected_cutout_uid for c in hits):
+                    self._cutout_click_was_selected = True
+                    target = self._get_selected_cutout() or hits[0]
+                else:
+                    self._cutout_click_was_selected = False
+                    target = hits[0]
+                    self._select_cutout(target.uid)
+                self._select_vertex(None)
+                rect = self._cutout_display_rect(target)
+                self._cutout_drag_mode = "move"
+                self._cutout_resize_handle = ""
+                self._cutout_drag_start_board = board_pos
+                self._cutout_orig_rect = (rect.left(), rect.top(), rect.width(), rect.height())
+                self._cutout_orig_vertices = list(target.vertices)
+                self._cutout_drag_changed = False
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                event.accept()
+                return
+
+            # Clicked empty space: start new Custom Shape or freeform shape
+            self._select_vertex(None)
+            if self.active_cutout_shape == "custom":
+                cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
+                cy = board_pos.y()
+                new_custom = BoardCutout(
+                    shape="custom",
+                    inverted=self.active_cutout_inverted,
+                    vertices=[(cx, cy)],
+                )
+                self._drawing_custom_cutout = new_custom
+                self.board_item.drawing_custom_cutout = new_custom
+                self.board_item.drawing_custom_cursor = board_pos
+                self.board_item.custom_snap_guides = []
+                self.board_item.update()
+                event.accept()
+                return
+
+            new_cutout = BoardCutout(
+                shape=self.active_cutout_shape,
+                corner_radius=self.active_cutout_corner_radius,
+                inverted=(self.active_cutout_inverted or self.active_cutout_shape == "inverted_oval"),
+            )
+            self._set_cutout_from_display_rect(
+                new_cutout, QRectF(board_pos.x(), board_pos.y(), 4.0, 4.0)
+            )
+            self.config.cutouts.append(new_cutout)
+            self._select_cutout(new_cutout.uid)
+            self._cutout_drag_mode = "create"
+            self._cutout_resize_handle = ""
+            self._cutout_drag_start_board = board_pos
+            self._cutout_orig_rect = (board_pos.x(), board_pos.y(), 4.0, 4.0)
+            self._cutout_drag_changed = True
+            self.board_item.update()
+            self._notify_partner_sync(full=False)
             event.accept()
             return
 
@@ -2446,6 +3054,167 @@ class CanvasView(QGraphicsView):
                 QPointF(self.config.width_px - scene_pos.x(), scene_pos.y())
             )
 
+        # SHAPE PERFBOARD MODE (5): drag or hover
+        if self.current_mode == "shape":
+            board_pos = self.board_item.mapFromScene(scene_pos)
+            if self._bevel_active and self._bevel_orig_vertices and self._bevel_vertex_indices:
+                if self._bevel_start_pos is None:
+                    self._bevel_start_pos = board_pos
+                dist = math.hypot(
+                    board_pos.x() - self._bevel_start_pos.x(),
+                    board_pos.y() - self._bevel_start_pos.y(),
+                )
+                self.board_item.bevel_guide_line = (self._bevel_start_pos, board_pos)
+                self._update_bevel_preview(dist)
+                super().mouseMoveEvent(event)
+                return
+
+            if self._drawing_custom_cutout is not None:
+                cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
+                cy = board_pos.y()
+                sx, sy, guides = self._snap_custom_vertex(cx, cy, self._drawing_custom_cutout.vertices)
+                dx_disp = (self.config.width_px - sx) if self.config.view_side == "bottom" else sx
+                self.board_item.drawing_custom_cursor = QPointF(dx_disp, sy)
+                self.board_item.custom_snap_guides = guides
+                self.board_item.update()
+                super().mouseMoveEvent(event)
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+
+            sel_cutout = self._get_selected_cutout()
+            if self._cutout_drag_mode and sel_cutout is not None:
+                ox, oy, ow, oh = self._cutout_orig_rect
+                if self._cutout_drag_mode == "create":
+                    rect = QRectF(self._cutout_drag_start_board, board_pos).normalized()
+                    if rect.width() < 4.0:
+                        rect.setWidth(4.0)
+                    if rect.height() < 4.0:
+                        rect.setHeight(4.0)
+                    self._set_cutout_from_display_rect(sel_cutout, rect)
+                    self._cutout_drag_changed = True
+                elif self._cutout_drag_mode == "move":
+                    dx = board_pos.x() - self._cutout_drag_start_board.x()
+                    dy = board_pos.y() - self._cutout_drag_start_board.y()
+                    self._set_cutout_from_display_rect(
+                        sel_cutout, QRectF(ox + dx, oy + dy, ow, oh)
+                    )
+                    if sel_cutout.shape == "custom" and self._cutout_orig_vertices:
+                        cdx = -dx if self.config.view_side == "bottom" else dx
+                        sel_cutout.vertices = [(vx + cdx, vy + dy) for vx, vy in self._cutout_orig_vertices]
+                        sel_cutout.recompute_custom_bounds()
+                    if math.hypot(dx, dy) > 2.5:
+                        self._cutout_drag_changed = True
+                elif self._cutout_drag_mode == "rotate":
+                    rect = self._cutout_display_rect(sel_cutout)
+                    center = rect.center()
+                    cur_ang = math.degrees(math.atan2(board_pos.y() - center.y(), board_pos.x() - center.x()))
+                    delta_ang = cur_ang - self._cutout_rot_start_angle
+                    while delta_ang > 180.0:
+                        delta_ang -= 360.0
+                    while delta_ang < -180.0:
+                        delta_ang += 360.0
+                    if self.config.view_side == "bottom":
+                        delta_ang = -delta_ang
+                    raw_ang = self._cutout_rot_orig + delta_ang
+                    if is_ctrl and is_shift:
+                        new_ang = round(raw_ang / 15.0) * 15.0
+                    elif is_shift:
+                        new_ang = self._cutout_rot_orig + round(delta_ang / 15.0) * 15.0
+                    else:
+                        new_ang = raw_ang
+                    # Normalize to (-180, 180]
+                    new_ang = ((new_ang + 180.0) % 360.0) - 180.0
+                    sel_cutout.rotation = new_ang
+                    self._cutout_drag_changed = True
+                elif self._cutout_drag_mode == "move_vertex" and self.selected_vertex_idx is not None:
+                    local_pos = self._board_to_cutout_local_display(board_pos, sel_cutout)
+                    cx = (self.config.width_px - local_pos.x()) if self.config.view_side == "bottom" else local_pos.x()
+                    cy = local_pos.y()
+                    other_verts = [
+                        v for i, v in enumerate(sel_cutout.vertices) if i != self.selected_vertex_idx
+                    ]
+                    sx, sy, guides = self._snap_custom_vertex(cx, cy, other_verts)
+                    sel_cutout.vertices[self.selected_vertex_idx] = (sx, sy)
+                    sel_cutout.recompute_custom_bounds()
+                    self.board_item.custom_snap_guides = guides
+                    self._cutout_drag_changed = True
+                elif self._cutout_drag_mode == "resize":
+                    orig_center = QPointF(ox + ow * 0.5, oy + oh * 0.5)
+                    rot = -sel_cutout.rotation if self.config.view_side == "bottom" else sel_cutout.rotation
+                    t_inv = QTransform()
+                    t_inv.translate(orig_center.x(), orig_center.y())
+                    t_inv.rotate(-rot)
+                    t_inv.translate(-orig_center.x(), -orig_center.y())
+                    loc_cur = t_inv.map(board_pos)
+                    loc_start = t_inv.map(self._cutout_drag_start_board)
+                    dx = loc_cur.x() - loc_start.x()
+                    dy = loc_cur.y() - loc_start.y()
+
+                    x1, y1, x2, y2 = ox, oy, ox + ow, oy + oh
+                    h_code = self._cutout_resize_handle
+                    min_sz = 8.0
+                    if "L" in h_code:
+                        x1 = min(x2 - min_sz, ox + dx)
+                    if "R" in h_code:
+                        x2 = max(x1 + min_sz, ox + ow + dx)
+                    if "T" in h_code:
+                        y1 = min(y2 - min_sz, oy + dy)
+                    if "B" in h_code:
+                        y2 = max(y1 + min_sz, oy + oh + dy)
+                    nw, nh = x2 - x1, y2 - y1
+                    dcx_loc = (x1 + x2) * 0.5 - orig_center.x()
+                    dcy_loc = (y1 + y2) * 0.5 - orig_center.y()
+                    rad = math.radians(rot)
+                    dcx_w = dcx_loc * math.cos(rad) - dcy_loc * math.sin(rad)
+                    dcy_w = dcx_loc * math.sin(rad) + dcy_loc * math.cos(rad)
+                    new_cx = orig_center.x() + dcx_w
+                    new_cy = orig_center.y() + dcy_w
+                    new_disp_rect = QRectF(new_cx - nw * 0.5, new_cy - nh * 0.5, nw, nh)
+                    self._set_cutout_from_display_rect(sel_cutout, new_disp_rect)
+                    if sel_cutout.shape == "custom" and self._cutout_orig_vertices and ow > 1e-6 and oh > 1e-6:
+                        # Scale vertices from original canonical bounds to new canonical bounds
+                        old_xs = [v[0] for v in self._cutout_orig_vertices]
+                        old_ys = [v[1] for v in self._cutout_orig_vertices]
+                        omx, omy = min(old_xs), min(old_ys)
+                        omw = max(4.0, max(old_xs) - omx)
+                        omh = max(4.0, max(old_ys) - omy)
+                        sel_cutout.vertices = [
+                            (
+                                sel_cutout.x + ((vx - omx) / omw) * sel_cutout.w,
+                                sel_cutout.y + ((vy - omy) / omh) * sel_cutout.h,
+                            )
+                            for vx, vy in self._cutout_orig_vertices
+                        ]
+                    if math.hypot(dx, dy) > 0.1:
+                        self._cutout_drag_changed = True
+                self.board_item.update()
+                self._notify_partner_sync(full=False)
+                event.accept()
+                return
+
+            super().mouseMoveEvent(event)
+            # Hover cursor feedback in shape mode
+            if sel_cutout is not None and self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            elif sel_cutout is not None and self._hit_test_cutout_vertex(board_pos, sel_cutout) is not None:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                handle = self._hit_test_cutout_handle(board_pos, sel_cutout) if sel_cutout is not None else ""
+                if handle in ("TL", "BR"):
+                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif handle in ("TR", "BL"):
+                    self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif handle in ("L", "R"):
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                elif handle in ("T", "B"):
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
+                elif self._hit_test_cutout(board_pos) is not None:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+            self.board_item.set_hovered_hole(-1, -1)
+            return
+
         # Detect hovered resize border when idle (not placement/stroke/handle dragging)
         hover_edges = ""
         if (
@@ -2455,6 +3224,7 @@ class CanvasView(QGraphicsView):
             and not self._solder_erase_active
             and not self._jumper_drag_active
             and self._jumper_handle_drag_item is None
+            and self.current_mode != "shape"
         ):
             hover_edges = self._detect_board_resize_edges(scene_pos)
         if hover_edges != self._hovered_resize_edges:
@@ -2596,6 +3366,41 @@ class CanvasView(QGraphicsView):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._is_panning:
             self._is_panning = False
+            self._update_cursor()
+            event.accept()
+            return
+
+        # Finish Shape Perfboard drag
+        if self._cutout_drag_mode is not None:
+            mode = self._cutout_drag_mode
+            changed = self._cutout_drag_changed
+            self._cutout_drag_mode = None
+            self._cutout_resize_handle = ""
+            self._cutout_drag_changed = False
+            sel_cutout = self._get_selected_cutout()
+            if mode == "create" and sel_cutout is not None:
+                if sel_cutout.w < 6.0 and sel_cutout.h < 6.0:
+                    cx = self._cutout_drag_start_board.x()
+                    cy = self._cutout_drag_start_board.y()
+                    self._set_cutout_from_display_rect(
+                        sel_cutout, QRectF(cx - 30.0, cy - 30.0, 60.0, 60.0)
+                    )
+                    changed = True
+            elif mode == "move" and not changed and self._cutout_click_was_selected and len(self._cutout_click_hits) > 1:
+                # Cycle to the next shape behind the current selection; wrap back to top
+                uids = [c.uid for c in self._cutout_click_hits]
+                if self.selected_cutout_uid in uids:
+                    cur_idx = uids.index(self.selected_cutout_uid)
+                    next_uid = uids[(cur_idx + 1) % len(uids)]
+                    self._select_cutout(next_uid)
+            self.board_item.custom_snap_guides = []
+            self._cutout_click_hits = []
+            self._cutout_click_was_selected = False
+            self.board_item.update()
+            self._notify_partner_sync(full=False)
+            if changed:
+                self.record_undo_snapshot()
+                self.cutout_selection_changed.emit(self.selected_cutout_uid)
             self._update_cursor()
             event.accept()
             return
@@ -2773,8 +3578,22 @@ class CanvasView(QGraphicsView):
             self.set_mode("autoconnect")
             event.accept()
             return
+        elif key == Qt.Key.Key_5:
+            self.set_mode("shape")
+            event.accept()
+            return
+
+        elif key == Qt.Key.Key_B and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            if self.current_mode == "shape" and self._start_bevel():
+                event.accept()
+                return
 
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.current_mode == "shape" and self._drawing_custom_cutout is not None:
+                if len(self._drawing_custom_cutout.vertices) >= 3:
+                    self._finish_custom_drawing()
+                event.accept()
+                return
             if self.current_mode == "autoconnect":
                 self.perform_autoconnect()
                 event.accept()
@@ -2807,6 +3626,17 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         elif key == Qt.Key.Key_Escape:
+            if self.current_mode == "shape":
+                if self._bevel_active:
+                    self._cancel_bevel()
+                elif self._drawing_custom_cutout is not None:
+                    self._cancel_custom_drawing()
+                elif self.selected_vertex_idx is not None:
+                    self._select_vertex(None)
+                elif self.selected_cutout_uid is not None:
+                    self._select_cutout(None)
+                event.accept()
+                return
             if self.current_mode == "autoconnect":
                 if self.autoconnect_selected_targets:
                     self.autoconnect_selected_targets.clear()

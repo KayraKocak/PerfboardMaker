@@ -35,6 +35,21 @@ def serialize_state(
             "pitch_px": config.pitch_px,
             "style": config.style,
             "view_side": config.view_side,
+            "cutouts": [
+                {
+                    "shape": c.shape,
+                    "x": c.x,
+                    "y": c.y,
+                    "w": c.w,
+                    "h": c.h,
+                    "corner_radius": c.corner_radius,
+                    "rotation": c.rotation,
+                    "inverted": c.inverted,
+                    "vertices": [list(v) for v in c.vertices],
+                    "uid": c.uid,
+                }
+                for c in getattr(config, "cutouts", [])
+            ],
         },
         "components": [
             {

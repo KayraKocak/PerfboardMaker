@@ -4,14 +4,14 @@ Includes live Jumper color palette and solder tool information.
 """
 import json
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSpinBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
     QAbstractSpinBox, QToolButton, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QGroupBox, QGridLayout,
-    QApplication, QInputDialog, QMessageBox, QSplitter, QSizePolicy
+    QApplication, QInputDialog, QMessageBox, QSplitter, QSizePolicy, QButtonGroup, QCheckBox
 )
 from PyQt6.QtGui import QColor, QFont, QCursor
 from PyQt6.QtCore import Qt, pyqtSignal, QSettings
-from app.models.board import BoardConfig, col_index_to_name
+from app.models.board import BoardConfig, BoardCutout, col_index_to_name
 from app.models.placed_component import PlacedComponent
 from app.models.solder import SelectedSolderPath
 from app.models.jumper import JumperWire, JUMPER_COLORS, DEFAULT_JUMPER_COLOR
@@ -152,6 +152,10 @@ class PropertiesWidget(QWidget):
     ungroup_requested = pyqtSignal()                 # Trigger Ctrl+Shift+G
     clear_groups_requested = pyqtSignal()
     optimize_board_requested = pyqtSignal()          # Re-extract shorted nets, clear traces/jumpers, and optimize
+    cutout_tool_changed = pyqtSignal(str, float, bool)  # shape, corner_radius, inverted
+    cutout_modified = pyqtSignal()                      # Selected cutout edited from inspector
+    cutout_delete_requested = pyqtSignal(str)           # Delete cutout by uid
+    cutouts_clear_requested = pyqtSignal()              # Clear all cutouts
 
     def __init__(self, config: BoardConfig, parent=None):
         super().__init__(parent)
@@ -159,6 +163,12 @@ class PropertiesWidget(QWidget):
         self.selected_item = None
         self.active_mode = "select"
         self.active_jumper_color = DEFAULT_JUMPER_COLOR
+
+        # Shape Perfboard tool state
+        self.active_cutout_shape: str = "rect"
+        self.active_cutout_corner_radius: float = 12.0
+        self.active_cutout_inverted: bool = False
+        self.selected_cutout_uid: str | None = None
 
         # AutoConnect Settings, Presets, Targets & Groups
         self.autoconnect_settings = AutoConnectSettings()
@@ -274,6 +284,11 @@ class PropertiesWidget(QWidget):
             else:
                 self._refresh_tool_panel()
 
+    def set_selected_cutout(self, uid: str | None):
+        self.selected_cutout_uid = uid
+        if self.active_mode == "shape":
+            self._refresh_tool_panel()
+
     def refresh_view(self):
         self._refresh_tool_panel()
         self._refresh_object_panel()
@@ -286,6 +301,8 @@ class PropertiesWidget(QWidget):
             self.show_solder_tool_settings()
         elif self.active_mode == "autoconnect":
             self.show_autoconnect_settings()
+        elif self.active_mode == "shape":
+            self.show_shape_perfboard_settings()
         else:
             self.show_board_properties()
 
@@ -1336,3 +1353,233 @@ class PropertiesWidget(QWidget):
 
         self._clear_qlayout(self.sel_targets_layout)
         self._populate_targets_layout()
+
+    # SHAPE PERFBOARD SETTINGS PANEL
+    def show_shape_perfboard_settings(self):
+        self.title_lbl.setText("SHAPE PERFBOARD (5)")
+
+        guide_grp = QGroupBox("How to Shape Perfboard")
+        guide_grp.setStyleSheet("QGroupBox { font-weight: bold; color: #00e6ff; }")
+        g_layout = QVBoxLayout(guide_grp)
+        tips_lbl = QLabel(
+            "• Drag to cut Rect/Oval, or click vertices for Custom Shape (click start / double-click / Enter to close).\n"
+            "• Click overlapping shapes repeatedly to cycle selection behind top shapes.\n"
+            "• Drag the cyan top handle to rotate (Shift: 15° relative, Ctrl+Shift: 15° world).\n"
+            "• Custom Shape: drag vertices (auto-aligns within 5px). Select vertex + Ctrl+B to bevel, Wheel for curve points, Left-click to apply, Right-click to cancel.\n"
+            "• Press Del / Backspace to remove the selected shape."
+        )
+        tips_lbl.setStyleSheet("color: #949ba4; font-size: 11px; line-height: 1.4;")
+        tips_lbl.setWordWrap(True)
+        g_layout.addWidget(tips_lbl)
+        self.layout.addWidget(guide_grp)
+
+        # Cutter Shape Selector
+        tool_grp = QGroupBox("Cutter Shape")
+        tool_grp.setStyleSheet("QGroupBox { font-weight: bold; color: #dbdee1; }")
+        t_layout = QVBoxLayout(tool_grp)
+        t_layout.setSpacing(6)
+
+        shapes = [
+            ("rect", "Rectangle"),
+            ("rounded_rect", "Rounded Corner Rectangle"),
+            ("oval", "Oval"),
+            ("inverted_oval", "Inverted Oval (Oval Board)"),
+            ("custom", "Custom Shape (Polygon)"),
+        ]
+        self._shape_btn_group = QButtonGroup(self)
+        self._shape_btn_group.setExclusive(True)
+        for key, label in shapes:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(self.active_cutout_shape == key)
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.setStyleSheet(
+                "QPushButton { text-align: left; padding: 6px 10px; border-radius: 4px; "
+                "background-color: #2b2d31; color: #dbdee1; border: 1px solid #3f4147; }"
+                "QPushButton:checked { background-color: #5865f2; color: #ffffff; border-color: #7289da; font-weight: bold; }"
+                "QPushButton:hover:!checked { background-color: #35373c; }"
+            )
+            btn.clicked.connect(lambda checked, s=key: self._on_cutout_shape_picked(s))
+            self._shape_btn_group.addButton(btn)
+            t_layout.addWidget(btn)
+
+        # Corner radius control (for Rounded Corner Rectangle)
+        cr_row = QHBoxLayout()
+        cr_lbl = QLabel("Corner Radius:")
+        cr_lbl.setStyleSheet("color: #b5bac1;")
+        self.spin_cutout_radius = QDoubleSpinBox()
+        self.spin_cutout_radius.setRange(0.0, 200.0)
+        self.spin_cutout_radius.setSingleStep(2.0)
+        self.spin_cutout_radius.setDecimals(1)
+        self.spin_cutout_radius.setSuffix(" px")
+        self.spin_cutout_radius.setValue(self.active_cutout_corner_radius)
+        self.spin_cutout_radius.setEnabled(self.active_cutout_shape == "rounded_rect")
+        self.spin_cutout_radius.valueChanged.connect(self._on_cutout_radius_changed)
+        cr_row.addWidget(cr_lbl)
+        cr_row.addWidget(self.spin_cutout_radius)
+        t_layout.addLayout(cr_row)
+
+        # Invert Shape toggle for new shapes
+        self.chk_cutout_inverted = QCheckBox("Invert Shape (Cut Outside)")
+        self.chk_cutout_inverted.setChecked(
+            self.active_cutout_inverted or self.active_cutout_shape == "inverted_oval"
+        )
+        self.chk_cutout_inverted.setEnabled(self.active_cutout_shape != "inverted_oval")
+        self.chk_cutout_inverted.toggled.connect(self._on_cutout_inverted_toggled)
+        t_layout.addWidget(self.chk_cutout_inverted)
+
+        self.layout.addWidget(tool_grp)
+
+        # Selected Cutout Inspector
+        sel_cutout = next(
+            (c for c in getattr(self.config, "cutouts", []) if c.uid == self.selected_cutout_uid),
+            None,
+        )
+        if sel_cutout is not None:
+            sel_grp = QGroupBox("Selected Cutout")
+            sel_grp.setStyleSheet("QGroupBox { font-weight: bold; color: #dbdee1; }")
+            s_layout = QGridLayout(sel_grp)
+            s_layout.setSpacing(6)
+
+            s_layout.addWidget(QLabel("Shape:"), 0, 0)
+            combo_shape = QComboBox()
+            for key, label in shapes:
+                if key == "custom" and sel_cutout.shape != "custom":
+                    continue
+                combo_shape.addItem(label, key)
+            idx = combo_shape.findData(sel_cutout.shape)
+            if idx >= 0:
+                combo_shape.setCurrentIndex(idx)
+            combo_shape.setEnabled(sel_cutout.shape != "custom")
+            combo_shape.currentIndexChanged.connect(
+                lambda _i, cb=combo_shape, c=sel_cutout: self._on_selected_cutout_shape_changed(c, cb.currentData())
+            )
+            s_layout.addWidget(combo_shape, 0, 1)
+
+            row_idx = 1
+            if sel_cutout.shape == "rounded_rect":
+                s_layout.addWidget(QLabel("Radius:"), row_idx, 0)
+                spin_r = QDoubleSpinBox()
+                spin_r.setRange(0.0, 200.0)
+                spin_r.setSingleStep(2.0)
+                spin_r.setDecimals(1)
+                spin_r.setSuffix(" px")
+                spin_r.setValue(sel_cutout.corner_radius)
+                spin_r.valueChanged.connect(
+                    lambda val, c=sel_cutout: self._on_selected_cutout_prop_changed(c, "corner_radius", val)
+                )
+                s_layout.addWidget(spin_r, row_idx, 1)
+                row_idx += 1
+
+            chk_sel_inv = QCheckBox("Invert Shape (Cut Outside)")
+            chk_sel_inv.setChecked(sel_cutout.is_inverted)
+            chk_sel_inv.toggled.connect(
+                lambda checked, c=sel_cutout: self._on_selected_cutout_inverted_toggled(c, checked)
+            )
+            s_layout.addWidget(chk_sel_inv, row_idx, 0, 1, 2)
+            row_idx += 1
+
+            s_layout.addWidget(QLabel("Rotation (°):"), row_idx, 0)
+            spin_rot = QDoubleSpinBox()
+            spin_rot.setRange(-360.0, 360.0)
+            spin_rot.setSingleStep(5.0)
+            spin_rot.setDecimals(1)
+            spin_rot.setSuffix(" °")
+            spin_rot.setValue(sel_cutout.rotation)
+            spin_rot.valueChanged.connect(
+                lambda val, c=sel_cutout: self._on_selected_cutout_prop_changed(c, "rotation", val)
+            )
+            s_layout.addWidget(spin_rot, row_idx, 1)
+            row_idx += 1
+
+            if sel_cutout.shape != "custom":
+                for attr, lbl_text, min_val in (
+                    ("x", "X (px):", -1000.0),
+                    ("y", "Y (px):", -1000.0),
+                    ("w", "Width (px):", 8.0),
+                    ("h", "Height (px):", 8.0),
+                ):
+                    s_layout.addWidget(QLabel(lbl_text), row_idx, 0)
+                    spin = QDoubleSpinBox()
+                    spin.setRange(min_val, 5000.0)
+                    spin.setSingleStep(2.0)
+                    spin.setDecimals(1)
+                    spin.setValue(getattr(sel_cutout, attr))
+                    spin.valueChanged.connect(
+                        lambda val, c=sel_cutout, a=attr: self._on_selected_cutout_prop_changed(c, a, val)
+                    )
+                    s_layout.addWidget(spin, row_idx, 1)
+                    row_idx += 1
+
+            btn_del = QPushButton("🗑️ Delete Selected Shape")
+            btn_del.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_del.setStyleSheet(
+                "QPushButton { background-color: #da373c; color: #ffffff; font-weight: bold; padding: 6px; border-radius: 4px; }"
+                "QPushButton:hover { background-color: #a12828; }"
+            )
+            btn_del.clicked.connect(lambda: self.cutout_delete_requested.emit(sel_cutout.uid))
+            s_layout.addWidget(btn_del, row_idx, 0, 1, 2)
+
+            self.layout.addWidget(sel_grp)
+
+        # Cutouts summary / clear all
+        cutouts = getattr(self.config, "cutouts", [])
+        if cutouts:
+            btn_clear = QPushButton(f"Clear All Cutouts ({len(cutouts)})")
+            btn_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_clear.setStyleSheet(
+                "QPushButton { background-color: #2b2d31; color: #f23f43; font-weight: bold; padding: 6px; "
+                "border: 1px solid #4e5058; border-radius: 4px; }"
+                "QPushButton:hover { background-color: #3b2427; }"
+            )
+            btn_clear.clicked.connect(self.cutouts_clear_requested.emit)
+            self.layout.addWidget(btn_clear)
+
+        self.layout.addStretch()
+
+    def _on_cutout_shape_picked(self, shape: str):
+        self.active_cutout_shape = shape
+        if hasattr(self, "spin_cutout_radius"):
+            self.spin_cutout_radius.setEnabled(shape == "rounded_rect")
+        if hasattr(self, "chk_cutout_inverted"):
+            self.chk_cutout_inverted.blockSignals(True)
+            self.chk_cutout_inverted.setChecked(
+                self.active_cutout_inverted or shape == "inverted_oval"
+            )
+            self.chk_cutout_inverted.setEnabled(shape != "inverted_oval")
+            self.chk_cutout_inverted.blockSignals(False)
+        self.cutout_tool_changed.emit(
+            self.active_cutout_shape, self.active_cutout_corner_radius, self.active_cutout_inverted
+        )
+
+    def _on_cutout_radius_changed(self, val: float):
+        self.active_cutout_corner_radius = float(val)
+        self.cutout_tool_changed.emit(
+            self.active_cutout_shape, self.active_cutout_corner_radius, self.active_cutout_inverted
+        )
+
+    def _on_cutout_inverted_toggled(self, checked: bool):
+        self.active_cutout_inverted = bool(checked)
+        self.cutout_tool_changed.emit(
+            self.active_cutout_shape, self.active_cutout_corner_radius, self.active_cutout_inverted
+        )
+
+    def _on_selected_cutout_shape_changed(self, cutout: BoardCutout, shape: str):
+        if shape and cutout.shape != shape:
+            cutout.shape = shape
+            if shape == "inverted_oval":
+                cutout.inverted = True
+            self.cutout_modified.emit()
+            self._refresh_tool_panel()
+
+    def _on_selected_cutout_inverted_toggled(self, cutout: BoardCutout, checked: bool):
+        if cutout.shape == "inverted_oval" and not checked:
+            cutout.shape = "oval"
+        cutout.inverted = bool(checked)
+        self.cutout_modified.emit()
+        self._refresh_tool_panel()
+
+    def _on_selected_cutout_prop_changed(self, cutout: BoardCutout, attr: str, val: float):
+        setattr(cutout, attr, float(val))
+        self.cutout_modified.emit()
+
