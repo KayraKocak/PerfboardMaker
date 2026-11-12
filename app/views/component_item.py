@@ -82,9 +82,7 @@ class ComponentItem(QGraphicsItem):
         transform = QTransform()
         if self.config.view_side == "bottom":
             transform.scale(-1.0, 1.0)
-            transform.rotate(-self.instance.rotation)
-        else:
-            transform.rotate(self.instance.rotation)
+        transform.rotate(self.instance.rotation)
         return transform.map(raw_path)
 
     def boundingRect(self) -> QRectF:
@@ -102,7 +100,7 @@ class ComponentItem(QGraphicsItem):
 
         if is_bottom:
             painter.scale(-1.0, 1.0)
-            painter.rotate(-self.instance.rotation)
+            painter.rotate(self.instance.rotation)
             if is_transparent:
                 painter.save()
                 painter.setOpacity(0.38)
