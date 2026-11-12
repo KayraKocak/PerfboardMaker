@@ -348,6 +348,7 @@ class MainWindow(QMainWindow):
             cv.autoconnect_groups_changed.connect(self.properties.set_autoconnect_groups)
             cv.autoconnect_completed.connect(self._on_autoconnect_completed)
             cv.cutout_selection_changed.connect(self.properties.set_selected_cutout)
+            cv.cutout_tool_synced.connect(self._on_canvas_cutout_tool_synced)
 
         self.canvas.view_side_changed.connect(self._on_view_side_changed)
 
@@ -868,6 +869,11 @@ class MainWindow(QMainWindow):
     def _on_cutout_tool_changed(self, shape: str, corner_radius: float, inverted: bool):
         self.canvas.set_cutout_tool(shape, corner_radius, inverted)
         self.canvas_back.set_cutout_tool(shape, corner_radius, inverted)
+
+    def _on_canvas_cutout_tool_synced(self, shape: str):
+        self.canvas.active_cutout_shape = shape
+        self.canvas_back.active_cutout_shape = shape
+        self.properties.set_active_cutout_shape(shape)
 
     def _on_cutout_modified(self):
         self.canvas.board_item.update()

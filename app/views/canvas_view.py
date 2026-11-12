@@ -7,7 +7,9 @@ Includes Select (1), Solder (2), Jumper (3) modes with:
 - Straight jumpers with draggable endpoints
 - Shift+Click bend points insertion and dragging
 """
+import copy
 import math
+import uuid
 from typing import Any
 from collections import deque
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsItem
@@ -83,6 +85,8 @@ class CanvasView(QGraphicsView):
     autoconnect_completed = pyqtSignal(dict)        # result dictionary
     board_resized = pyqtSignal(int, int)            # cols, rows
     cutout_selection_changed = pyqtSignal(object)   # str uid or None
+    cutout_tool_synced = pyqtSignal(str)            # active cutout shape synced back to inspector
+    _clipboard_payload: dict | None = None
 
     def __init__(self, config: BoardConfig, parent=None, primary_view: "CanvasView | None" = None):
         super().__init__(parent)
@@ -606,6 +610,14 @@ class CanvasView(QGraphicsView):
         self.active_cutout_inverted = bool(inverted)
         if shape != "custom" and self._drawing_custom_cutout is not None:
             self._cancel_custom_drawing()
+        if shape != "select" and (self.selected_cutout_uid is not None or self.selected_vertex_indices):
+            self._select_cutout(None)
+            self._select_vertex(None)
+
+    def _switch_cutout_tool_to_select(self):
+        if self.active_cutout_shape != "select":
+            self.active_cutout_shape = "select"
+            self.cutout_tool_synced.emit("select")
 
     def _get_selected_cutout(self) -> BoardCutout | None:
         if not self.selected_cutout_uid:
@@ -783,6 +795,7 @@ class CanvasView(QGraphicsView):
             c.recompute_custom_bounds()
             self.config.cutouts.append(c)
             self._select_cutout(c.uid)
+            self._switch_cutout_tool_to_select()
             self.record_undo_snapshot()
         self.board_item.update()
         self._notify_partner_sync(full=False)
@@ -959,6 +972,132 @@ class CanvasView(QGraphicsView):
         self._notify_partner_sync(full=False)
         self.record_undo_snapshot()
         self.cutout_selection_changed.emit(None)
+
+    def copy_selection(self) -> bool:
+        if self.current_mode == "shape":
+            sel_cutout = self._get_selected_cutout()
+            if sel_cutout is not None:
+                CanvasView._clipboard_payload = {
+                    "kind": "cutout",
+                    "data": copy.deepcopy(sel_cutout),
+                    "paste_count": 0,
+                }
+                return True
+            return False
+
+        if self.current_mode == "select":
+            sel_comp = self.get_selected_component_item()
+            if sel_comp is not None:
+                inst = sel_comp.instance
+                CanvasView._clipboard_payload = {
+                    "kind": "component",
+                    "data": {
+                        "type_id": inst.type_id,
+                        "grid_x": inst.grid_x,
+                        "grid_y": inst.grid_y,
+                        "label": inst.label,
+                        "rotation": inst.rotation,
+                        "custom_props": copy.deepcopy(inst.custom_props),
+                    },
+                    "paste_count": 0,
+                }
+                return True
+            sel_jumper = self.get_selected_jumper_item()
+            if sel_jumper is not None:
+                w = sel_jumper.jumper
+                CanvasView._clipboard_payload = {
+                    "kind": "jumper",
+                    "data": {
+                        "start_col": w.start_col,
+                        "start_row": w.start_row,
+                        "end_col": w.end_col,
+                        "end_row": w.end_row,
+                        "bends": [tuple(b) for b in w.bends],
+                        "color": w.color,
+                        "side": w.side,
+                    },
+                    "paste_count": 0,
+                }
+                return True
+        return False
+
+    def paste_selection(self) -> bool:
+        payload = CanvasView._clipboard_payload
+        if not payload:
+            return False
+        kind = payload.get("kind")
+
+        if self.current_mode == "shape" and kind == "cutout":
+            payload["paste_count"] = int(payload.get("paste_count", 0)) + 1
+            offset = 20.0 * payload["paste_count"]
+            new_cutout = copy.deepcopy(payload["data"])
+            new_cutout.uid = uuid.uuid4().hex[:8]
+            new_cutout.x += offset
+            new_cutout.y += offset
+            if new_cutout.shape == "custom" and new_cutout.vertices:
+                new_cutout.vertices = [(vx + offset, vy + offset) for vx, vy in new_cutout.vertices]
+                new_cutout.recompute_custom_bounds()
+            self.config.cutouts.append(new_cutout)
+            self._switch_cutout_tool_to_select()
+            self._select_cutout(new_cutout.uid)
+            self._select_vertex(None)
+            self.board_item.update()
+            self._notify_partner_sync(full=False)
+            self.record_undo_snapshot()
+            return True
+
+        if self.current_mode == "select" and kind == "component":
+            d = payload["data"]
+            comp_def = REGISTRY.get(d["type_id"])
+            if not comp_def:
+                return False
+            payload["paste_count"] = int(payload.get("paste_count", 0)) + 1
+            step = payload["paste_count"]
+            instance = PlacedComponent(
+                type_id=d["type_id"],
+                grid_x=d["grid_x"] + step,
+                grid_y=d["grid_y"] + step,
+                label=d["label"],
+                rotation=d["rotation"],
+                custom_props=copy.deepcopy(d["custom_props"]),
+            )
+            self.placed_components.append(instance)
+            item = ComponentItem(instance, comp_def, self.config)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            self.component_items.append(item)
+            self.scene.addItem(item)
+            self.scene.clearSelection()
+            item.setSelected(True)
+            self.selection_changed.emit(item)
+            self._notify_partner_sync(full=True)
+            self.record_undo_snapshot()
+            return True
+
+        if self.current_mode == "select" and kind == "jumper":
+            d = payload["data"]
+            payload["paste_count"] = int(payload.get("paste_count", 0)) + 1
+            step = payload["paste_count"]
+            wire = JumperWire(
+                start_col=d["start_col"] + step,
+                start_row=d["start_row"] + step,
+                end_col=d["end_col"] + step,
+                end_row=d["end_row"] + step,
+                bends=[(bc + step, br + step) for bc, br in d["bends"]],
+                color=d["color"],
+                side=d["side"],
+            )
+            self.jumpers.append(wire)
+            j_item = JumperItem(wire, self.config)
+            self.jumper_items.append(j_item)
+            self.scene.addItem(j_item)
+            self.scene.clearSelection()
+            j_item.setSelected(True)
+            self.selection_changed.emit(j_item)
+            self._notify_partner_sync(full=True)
+            self.record_undo_snapshot()
+            return True
+
+        return False
 
     def set_active_jumper_color(self, hex_color: str):
         self.active_jumper_color = hex_color
@@ -2708,70 +2847,77 @@ class CanvasView(QGraphicsView):
 
             self._cutout_click_hits = []
             self._cutout_click_was_selected = False
-            sel_cutout = self._get_selected_cutout()
-            if sel_cutout is not None:
-                if self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
-                    rect = self._cutout_display_rect(sel_cutout)
-                    center = rect.center()
-                    self._cutout_drag_mode = "rotate"
-                    self._cutout_drag_start_board = board_pos
-                    self._cutout_rot_start_angle = math.degrees(
-                        math.atan2(board_pos.y() - center.y(), board_pos.x() - center.x())
-                    )
-                    self._cutout_rot_orig = sel_cutout.rotation
-                    self._cutout_drag_changed = False
-                    event.accept()
-                    return
-
-                v_idx = self._hit_test_cutout_vertex(board_pos, sel_cutout)
-                if v_idx is not None:
-                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                        self._select_vertex(v_idx, toggle=True)
+            if self.active_cutout_shape == "select":
+                sel_cutout = self._get_selected_cutout()
+                if sel_cutout is not None:
+                    if self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
+                        rect = self._cutout_display_rect(sel_cutout)
+                        center = rect.center()
+                        self._cutout_drag_mode = "rotate"
+                        self._cutout_drag_start_board = board_pos
+                        self._cutout_rot_start_angle = math.degrees(
+                            math.atan2(board_pos.y() - center.y(), board_pos.x() - center.x())
+                        )
+                        self._cutout_rot_orig = sel_cutout.rotation
+                        self._cutout_drag_changed = False
                         event.accept()
                         return
-                    self._select_vertex(v_idx, toggle=False)
-                    self._cutout_drag_mode = "move_vertex"
-                    self._cutout_drag_start_board = board_pos
-                    self._cutout_orig_vertices = list(sel_cutout.vertices)
-                    self._cutout_drag_changed = False
-                    event.accept()
-                    return
 
-                handle = self._hit_test_cutout_handle(board_pos, sel_cutout)
-                if handle:
-                    rect = self._cutout_display_rect(sel_cutout)
-                    self._cutout_drag_mode = "resize"
-                    self._cutout_resize_handle = handle
+                    v_idx = self._hit_test_cutout_vertex(board_pos, sel_cutout)
+                    if v_idx is not None:
+                        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                            self._select_vertex(v_idx, toggle=True)
+                            event.accept()
+                            return
+                        self._select_vertex(v_idx, toggle=False)
+                        self._cutout_drag_mode = "move_vertex"
+                        self._cutout_drag_start_board = board_pos
+                        self._cutout_orig_vertices = list(sel_cutout.vertices)
+                        self._cutout_drag_changed = False
+                        event.accept()
+                        return
+
+                    handle = self._hit_test_cutout_handle(board_pos, sel_cutout)
+                    if handle:
+                        rect = self._cutout_display_rect(sel_cutout)
+                        self._cutout_drag_mode = "resize"
+                        self._cutout_resize_handle = handle
+                        self._cutout_drag_start_board = board_pos
+                        self._cutout_orig_rect = (rect.left(), rect.top(), rect.width(), rect.height())
+                        self._cutout_orig_vertices = list(sel_cutout.vertices)
+                        self._cutout_drag_changed = False
+                        event.accept()
+                        return
+
+                hits = self._hit_test_cutouts(board_pos)
+                if hits:
+                    self._cutout_click_hits = hits
+                    if self.selected_cutout_uid and any(c.uid == self.selected_cutout_uid for c in hits):
+                        self._cutout_click_was_selected = True
+                        target = self._get_selected_cutout() or hits[0]
+                    else:
+                        self._cutout_click_was_selected = False
+                        target = hits[0]
+                        self._select_cutout(target.uid)
+                    self._select_vertex(None)
+                    rect = self._cutout_display_rect(target)
+                    self._cutout_drag_mode = "move"
+                    self._cutout_resize_handle = ""
                     self._cutout_drag_start_board = board_pos
                     self._cutout_orig_rect = (rect.left(), rect.top(), rect.width(), rect.height())
-                    self._cutout_orig_vertices = list(sel_cutout.vertices)
+                    self._cutout_orig_vertices = list(target.vertices)
                     self._cutout_drag_changed = False
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
                     event.accept()
                     return
 
-            hits = self._hit_test_cutouts(board_pos)
-            if hits:
-                self._cutout_click_hits = hits
-                if self.selected_cutout_uid and any(c.uid == self.selected_cutout_uid for c in hits):
-                    self._cutout_click_was_selected = True
-                    target = self._get_selected_cutout() or hits[0]
-                else:
-                    self._cutout_click_was_selected = False
-                    target = hits[0]
-                    self._select_cutout(target.uid)
+                # Clicked empty space in Select mode: deselect without drawing
+                self._select_cutout(None)
                 self._select_vertex(None)
-                rect = self._cutout_display_rect(target)
-                self._cutout_drag_mode = "move"
-                self._cutout_resize_handle = ""
-                self._cutout_drag_start_board = board_pos
-                self._cutout_orig_rect = (rect.left(), rect.top(), rect.width(), rect.height())
-                self._cutout_orig_vertices = list(target.vertices)
-                self._cutout_drag_changed = False
-                self.setCursor(Qt.CursorShape.SizeAllCursor)
                 event.accept()
                 return
 
-            # Clicked empty space: start new Custom Shape or freeform shape
+            # Cutter shape active: guarantee drawing new shape (even over existing shapes)
             self._select_vertex(None)
             if self.active_cutout_shape == "custom":
                 cx = (self.config.width_px - board_pos.x()) if self.config.view_side == "bottom" else board_pos.x()
@@ -3194,7 +3340,9 @@ class CanvasView(QGraphicsView):
 
             super().mouseMoveEvent(event)
             # Hover cursor feedback in shape mode
-            if sel_cutout is not None and self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
+            if self.active_cutout_shape != "select":
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            elif sel_cutout is not None and self._hit_test_cutout_rot_handle(board_pos, sel_cutout):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
             elif sel_cutout is not None and self._hit_test_cutout_vertex(board_pos, sel_cutout) is not None:
                 self.setCursor(Qt.CursorShape.CrossCursor)
@@ -3211,7 +3359,7 @@ class CanvasView(QGraphicsView):
                 elif self._hit_test_cutout(board_pos) is not None:
                     self.setCursor(Qt.CursorShape.SizeAllCursor)
                 else:
-                    self.setCursor(Qt.CursorShape.CrossCursor)
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
             self.board_item.set_hovered_hole(-1, -1)
             return
 
@@ -3386,13 +3534,19 @@ class CanvasView(QGraphicsView):
                         sel_cutout, QRectF(cx - 30.0, cy - 30.0, 60.0, 60.0)
                     )
                     changed = True
-            elif mode == "move" and not changed and self._cutout_click_was_selected and len(self._cutout_click_hits) > 1:
-                # Cycle to the next shape behind the current selection; wrap back to top
-                uids = [c.uid for c in self._cutout_click_hits]
-                if self.selected_cutout_uid in uids:
-                    cur_idx = uids.index(self.selected_cutout_uid)
-                    next_uid = uids[(cur_idx + 1) % len(uids)]
-                    self._select_cutout(next_uid)
+                self._switch_cutout_tool_to_select()
+            elif mode == "move" and not changed and self._cutout_click_was_selected:
+                if len(self._cutout_click_hits) > 1:
+                    # Cycle to the next shape behind the current selection; wrap back to top
+                    uids = [c.uid for c in self._cutout_click_hits]
+                    if self.selected_cutout_uid in uids:
+                        cur_idx = uids.index(self.selected_cutout_uid)
+                        next_uid = uids[(cur_idx + 1) % len(uids)]
+                        self._select_cutout(next_uid)
+                else:
+                    # Nothing else under the cursor to cycle to -> deselect
+                    self._select_cutout(None)
+                    self._select_vertex(None)
             self.board_item.custom_snap_guides = []
             self._cutout_click_hits = []
             self._cutout_click_was_selected = False
@@ -3552,6 +3706,14 @@ class CanvasView(QGraphicsView):
                 self.redo()
                 event.accept()
                 return
+            elif key == Qt.Key.Key_C:
+                if self.copy_selection():
+                    event.accept()
+                    return
+            elif key == Qt.Key.Key_V:
+                if self.paste_selection():
+                    event.accept()
+                    return
             elif key == Qt.Key.Key_G:
                 if self.current_mode == "autoconnect":
                     if modifiers & Qt.KeyboardModifier.ShiftModifier:

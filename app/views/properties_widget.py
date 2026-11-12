@@ -1362,10 +1362,10 @@ class PropertiesWidget(QWidget):
         guide_grp.setStyleSheet("QGroupBox { font-weight: bold; color: #00e6ff; }")
         g_layout = QVBoxLayout(guide_grp)
         tips_lbl = QLabel(
-            "• Drag to cut Rect/Oval, or click vertices for Custom Shape (click start / double-click / Enter to close).\n"
-            "• Click overlapping shapes repeatedly to cycle selection behind top shapes.\n"
+            "• Choose Select / Edit Shapes to select, move, resize, rotate, or edit vertices; choose any Cutter Shape below to draw (even on top of existing shapes).\n"
+            "• Click overlapping shapes repeatedly to cycle selection behind top shapes; clicking a shape with nothing behind it deselects it.\n"
             "• Drag the cyan top handle to rotate (Shift: 15° relative, Ctrl+Shift: 15° world).\n"
-            "• Custom Shape: drag vertices (auto-aligns within 5px). Select vertex + Ctrl+B to bevel, Wheel for curve points, Left-click to apply, Right-click to cancel.\n"
+            "• Custom Shape: drag vertices (auto-aligns within 5px). Shift+Click vertices + Ctrl+B to bevel, Wheel for curve points, Left-click to apply, Right-click to cancel.\n"
             "• Press Del / Backspace to remove the selected shape."
         )
         tips_lbl.setStyleSheet("color: #949ba4; font-size: 11px; line-height: 1.4;")
@@ -1380,6 +1380,7 @@ class PropertiesWidget(QWidget):
         t_layout.setSpacing(6)
 
         shapes = [
+            ("select", "Select / Edit Shapes"),
             ("rect", "Rectangle"),
             ("rounded_rect", "Rounded Corner Rectangle"),
             ("oval", "Oval"),
@@ -1388,6 +1389,7 @@ class PropertiesWidget(QWidget):
         ]
         self._shape_btn_group = QButtonGroup(self)
         self._shape_btn_group.setExclusive(True)
+        self._shape_buttons: dict[str, QPushButton] = {}
         for key, label in shapes:
             btn = QPushButton(label)
             btn.setCheckable(True)
@@ -1401,6 +1403,7 @@ class PropertiesWidget(QWidget):
             )
             btn.clicked.connect(lambda checked, s=key: self._on_cutout_shape_picked(s))
             self._shape_btn_group.addButton(btn)
+            self._shape_buttons[key] = btn
             t_layout.addWidget(btn)
 
         # Corner radius control (for Rounded Corner Rectangle)
@@ -1424,7 +1427,7 @@ class PropertiesWidget(QWidget):
         self.chk_cutout_inverted.setChecked(
             self.active_cutout_inverted or self.active_cutout_shape == "inverted_oval"
         )
-        self.chk_cutout_inverted.setEnabled(self.active_cutout_shape != "inverted_oval")
+        self.chk_cutout_inverted.setEnabled(self.active_cutout_shape not in ("inverted_oval", "select"))
         self.chk_cutout_inverted.toggled.connect(self._on_cutout_inverted_toggled)
         t_layout.addWidget(self.chk_cutout_inverted)
 
@@ -1537,6 +1540,20 @@ class PropertiesWidget(QWidget):
 
         self.layout.addStretch()
 
+    def set_active_cutout_shape(self, shape: str):
+        self.active_cutout_shape = shape
+        if hasattr(self, "_shape_buttons") and shape in self._shape_buttons:
+            self._shape_buttons[shape].setChecked(True)
+        if hasattr(self, "spin_cutout_radius"):
+            self.spin_cutout_radius.setEnabled(shape == "rounded_rect")
+        if hasattr(self, "chk_cutout_inverted"):
+            self.chk_cutout_inverted.blockSignals(True)
+            self.chk_cutout_inverted.setChecked(
+                self.active_cutout_inverted or shape == "inverted_oval"
+            )
+            self.chk_cutout_inverted.setEnabled(shape not in ("inverted_oval", "select"))
+            self.chk_cutout_inverted.blockSignals(False)
+
     def _on_cutout_shape_picked(self, shape: str):
         self.active_cutout_shape = shape
         if hasattr(self, "spin_cutout_radius"):
@@ -1546,7 +1563,7 @@ class PropertiesWidget(QWidget):
             self.chk_cutout_inverted.setChecked(
                 self.active_cutout_inverted or shape == "inverted_oval"
             )
-            self.chk_cutout_inverted.setEnabled(shape != "inverted_oval")
+            self.chk_cutout_inverted.setEnabled(shape not in ("inverted_oval", "select"))
             self.chk_cutout_inverted.blockSignals(False)
         self.cutout_tool_changed.emit(
             self.active_cutout_shape, self.active_cutout_corner_radius, self.active_cutout_inverted

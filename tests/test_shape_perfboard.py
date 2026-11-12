@@ -286,6 +286,88 @@ class TestShapePerfboard(unittest.TestCase):
         hits = cv._hit_test_cutouts(QPointF(80.0, 80.0))
         self.assertEqual([c.uid for c in hits], ["io1", "o1", "r1"])
 
+    def test_select_tool_deselects_single_hit_and_cutter_draws_over_shapes(self):
+        from PyQt6.QtCore import Qt, QPointF
+        from PyQt6.QtGui import QMouseEvent
+        from PyQt6.QtCore import QEvent
+
+        cfg = BoardConfig(cols=12, rows=12)
+        cv = CanvasView(cfg)
+        cv.resize(600, 600)
+        cv.set_mode("shape")
+
+        big = BoardCutout(shape="rect", x=20.0, y=20.0, w=200.0, h=200.0, uid="big")
+        cv.config.cutouts = [big]
+
+        def click_at(board_pt: QPointF):
+            scene_pt = cv.board_item.mapToScene(board_pt)
+            vp_pt = QPointF(cv.mapFromScene(scene_pt))
+            press = QMouseEvent(
+                QEvent.Type.MouseButtonPress, vp_pt, vp_pt, vp_pt,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+            )
+            release = QMouseEvent(
+                QEvent.Type.MouseButtonRelease, vp_pt, vp_pt, vp_pt,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            )
+            cv.mousePressEvent(press)
+            cv.mouseReleaseEvent(release)
+
+        # In Select tool: first click selects big, second click with nothing behind deselects it
+        cv.set_cutout_tool("select", 12.0, False)
+        click_at(QPointF(100.0, 100.0))
+        self.assertEqual(cv.selected_cutout_uid, "big")
+        click_at(QPointF(100.0, 100.0))
+        self.assertIsNone(cv.selected_cutout_uid)
+
+        # In Cutter shape tool ('rect'): clicking inside big draws a new shape instead of selecting big
+        cv.set_cutout_tool("rect", 12.0, False)
+        click_at(QPointF(100.0, 100.0))
+        self.assertEqual(len(cv.config.cutouts), 2)
+        self.assertNotEqual(cv.selected_cutout_uid, "big")
+        # Automatically switched back to 'select' so the user can adjust the new shape
+        self.assertEqual(cv.active_cutout_shape, "select")
+
+    def test_copy_paste_shapes_and_select_objects(self):
+        cfg = BoardConfig(cols=16, rows=16)
+        cv = CanvasView(cfg)
+
+        # Shape mode copy & paste
+        cv.set_mode("shape")
+        c = BoardCutout(shape="rect", x=30.0, y=40.0, w=50.0, h=60.0, uid="orig_shape")
+        cv.config.cutouts = [c]
+        cv._select_cutout("orig_shape")
+        self.assertTrue(cv.copy_selection())
+        self.assertTrue(cv.paste_selection())
+        self.assertEqual(len(cv.config.cutouts), 2)
+        pasted_c = cv.config.cutouts[1]
+        self.assertNotEqual(pasted_c.uid, "orig_shape")
+        self.assertAlmostEqual(pasted_c.x, 50.0, places=5)
+        self.assertAlmostEqual(pasted_c.y, 60.0, places=5)
+        self.assertEqual(cv.selected_cutout_uid, pasted_c.uid)
+
+        # Select mode copy & paste component and jumper
+        cv.set_mode("select")
+        placed_comp = cv.add_component("resistor_1_4w", 2, 3)
+        self.assertIsNotNone(placed_comp)
+        cv.scene.clearSelection()
+        cv.component_items[0].setSelected(True)
+        self.assertTrue(cv.copy_selection())
+        self.assertTrue(cv.paste_selection())
+        self.assertEqual(len(cv.placed_components), 2)
+        pasted_comp = cv.placed_components[1]
+        self.assertEqual((pasted_comp.grid_x, pasted_comp.grid_y), (3, 4))
+
+        j_wire = cv.add_jumper(1, 1, 4, 1)
+        self.assertIsNotNone(j_wire)
+        cv.scene.clearSelection()
+        cv.jumper_items[0].setSelected(True)
+        self.assertTrue(cv.copy_selection())
+        self.assertTrue(cv.paste_selection())
+        self.assertEqual(len(cv.jumpers), 2)
+        pasted_j = cv.jumpers[1]
+        self.assertEqual((pasted_j.start_col, pasted_j.start_row, pasted_j.end_col, pasted_j.end_row), (2, 2, 5, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
