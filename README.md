@@ -1,3 +1,6 @@
+# Very Important Bug Fix
+it seems like every version before v0.22 has a bug on the updater logic, so anyone using 0.21 or below will not be able to get the new updates just by clicking the glowing update button, they will have to re-download the project from github. I am sorry for the inconvenience.
+
 # PerfBoardMaker ⚡
 
 A desktop 2D orthogonal electronic CAD application for designing, routing, and prototyping perfboard circuits. Built with Python & PyQt6, featuring an accelerated native C++ multi-net AutoConnect router.
