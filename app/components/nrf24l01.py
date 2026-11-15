@@ -9,14 +9,14 @@ from app.models.component_def import ComponentDef, PinDef, PropertyDef
 from app.components.draw_utils import draw_solder_joint, draw_top_pin, draw_unmirrored_text
 
 NRF_PINS = [
-    PinDef(name="GND", grid_x=0, grid_y=0, description="Ground", pin_type="ground"),
-    PinDef(name="VCC", grid_x=0, grid_y=1, description="3.3V Supply", pin_type="power"),
-    PinDef(name="CE",  grid_x=1, grid_y=0, description="Chip Enable", pin_type="io"),
-    PinDef(name="CSN", grid_x=1, grid_y=1, description="SPI Chip Select", pin_type="io"),
-    PinDef(name="SCK", grid_x=2, grid_y=0, description="SPI Clock", pin_type="io"),
-    PinDef(name="MOSI", grid_x=2, grid_y=1, description="SPI Data In", pin_type="io"),
-    PinDef(name="MISO", grid_x=3, grid_y=0, description="SPI Data Out", pin_type="io"),
-    PinDef(name="IRQ", grid_x=3, grid_y=1, description="Interrupt Request", pin_type="io"),
+    PinDef(name="GND", grid_x=0, grid_y=1, description="Ground", pin_type="ground"),
+    PinDef(name="VCC", grid_x=0, grid_y=0, description="3.3V Supply", pin_type="power"),
+    PinDef(name="CE",  grid_x=1, grid_y=1, description="Chip Enable", pin_type="io"),
+    PinDef(name="CSN", grid_x=1, grid_y=0, description="SPI Chip Select", pin_type="io"),
+    PinDef(name="SCK", grid_x=2, grid_y=1, description="SPI Clock", pin_type="io"),
+    PinDef(name="MOSI", grid_x=2, grid_y=0, description="SPI Data In", pin_type="io"),
+    PinDef(name="MISO", grid_x=3, grid_y=1, description="SPI Data Out", pin_type="io"),
+    PinDef(name="IRQ", grid_x=3, grid_y=0, description="Interrupt Request", pin_type="io"),
 ]
 
 class NRF24L01Def(ComponentDef):
